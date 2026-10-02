@@ -159,6 +159,9 @@ func (i *Inbound) monitorRuntimeStats(ctx context.Context, done chan<- struct{},
 					haveVerdictSample = true
 				}
 			}
+			// DNS prefill counters must have a fixed observation interval even
+			// when outbound verdict and kernel counters remain idle.
+			i.logDirectOffloadRuntimeStats()
 			i.logUDPNATMemoryStats(reason)
 			timer.Reset(runtimeStatsInterval)
 		}
@@ -262,6 +265,9 @@ func (i *Inbound) logVerdictRuntimeStatsValue(reason string, stats ECommon.Verdi
 	} else {
 		i.logger.Info(logArgs...)
 	}
+}
+
+func (i *Inbound) logDirectOffloadRuntimeStats() {
 	// DIRECT offload counters (route-time + dns_prefill + live TC promoted set).
 	promotedLive := 0
 	i.bypassRuleSetAccess.Lock()

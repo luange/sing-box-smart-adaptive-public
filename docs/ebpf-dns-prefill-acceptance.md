@@ -21,7 +21,9 @@ not a dropped DNS response or packet. DNS Exchange must never wait for prefill.
 
 ## Counters and interpretation
 
-All counters are cumulative since process start; compare interval deltas.
+All counters are cumulative since process start. They are emitted at startup and
+every five minutes independently of outbound verdict activity; compare interval
+deltas.
 
 | Log field | Meaning |
 | --- | --- |
