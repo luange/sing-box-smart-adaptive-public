@@ -28,7 +28,7 @@
 
 ### 2. eBPF 网关（`type: ebpf`，`with_ebpf`）
 
-面向 **PBR + shared_network**（TC 接管网卡），不是 reF1nd cilium 整栈。
+面向 Linux 网关的 PBR 与 shared_network 部署，支持通过 TC 接管网卡流量。
 
 | 能力 | 说明 |
 |------|------|
@@ -108,7 +108,7 @@ sh scripts/bypass-miss-sample.sh 50
 | `origin` | 本仓库 `luange/sing-box-smart-adaptive` |
 | `sagernet` | 官方上游（可选 `git fetch sagernet`） |
 
-**不再跟踪 reF1nd 远程**；不合并其整树 eBPF overlay。
+代码以 SagerNet 官方上游为基础，并通过独立提交维护项目所需的扩展。
 
 客户端 submodule（`clients/apple|android|desktop`）为上游官方客户端工程，**仅官方 CI/打包需要**；纯网关二进制构建可忽略：
 
