@@ -12,12 +12,15 @@ not a dropped DNS response or packet. DNS Exchange must never wait for prefill.
   policy evaluation so proxy evidence can revoke an unsafe DIRECT promotion.
 - FakeIP remains authoritative and synchronous. It participates in the Close
   barrier but is not limited by the advisory worker budget.
-- TC DNS observations retain their separate bounded drain loop. They share
-  in-flight identity with the answer observer without consuming its worker
-  slots. Close must wait for both paths before releasing shared state.
-- Keep the worker count at two initially. A queue is warranted only if unique
-  valid tasks are still rejected under normal production load. If necessary,
-  use a bounded queue of at most 16 items with expiry and no DNS Exchange wait.
+- TC DNS observations retain their separate bounded drain loop. They are
+  processed even when an advisory answer with the same key is queued, so a
+  stale queued hint never suppresses stronger evidence. Close waits for both
+  paths before releasing shared state.
+- Keep at most two asynchronous workers. A five-minute production window with
+  1 rejection among 733 unique valid tasks (0.136%) crossed the 0.1% trigger,
+  so a 16-item bounded queue with a five-second expiry is now enabled. DNS
+  Exchange never waits for a worker or a queue slot. Remaining DNS TTL is
+  reduced by queue time before a promotion can be published.
 
 ## Counters and interpretation
 
@@ -31,7 +34,9 @@ deltas.
 | `dns_prefill_missing_deps` | Valid real-DNS answers without route dependencies |
 | `dns_prefill_coalesced` | In-flight duplicate tasks avoided |
 | `dns_prefill_admitted` | Real-DNS async tasks admitted |
-| `dns_prefill_queue_drops` | Unique valid advisory tasks rejected by full worker budget |
+| `dns_prefill_queue_drops` | Unique valid advisory tasks rejected after the 16-item queue is full |
+| `dns_prefill_queued`, `dns_prefill_expired` | Tasks admitted to the bounded queue and tasks that became stale there |
+| `dns_prefill_queue_depth`, `dns_prefill_queue_peak` | Current and peak queued tasks; peak must not exceed 16 |
 | `dns_prefill_active`, `dns_prefill_peak` | Current and peak async workers; peak must not exceed 2 |
 | `dns_prefill_eval_count`, `dns_prefill_eval_nanos` | Completed policy evaluations and cumulative duration |
 | `dns_prefill_eval_le_1ms`, `dns_prefill_eval_le_5ms`, `dns_prefill_eval_le_20ms`, `dns_prefill_eval_gt_20ms` | Exclusive duration buckets for an approximate p95 |
@@ -49,8 +54,8 @@ deltas.
    errors. Confirm Google 204 and YouTube 200 through the intended proxy path.
 4. Observe the new core for 24 hours. Normal traffic should produce no unique
    valid task rejection. If rejections exceed 0.1% of unique valid tasks in a
-   continuous five-minute window, investigate policy-evaluation duration and
-   implement the bounded second-stage queue.
+   continuous five-minute window despite the queue, investigate rule matching,
+   queue age, and worker contention before raising any capacity limit.
 5. DNS success rate must not fall. DNS p95 must not persist above the baseline
    by more than the larger of 5% or 2 ms under comparable traffic. There must
    be no sustained process CPU/RSS/goroutine regression or increase in V3

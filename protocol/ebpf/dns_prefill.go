@@ -28,7 +28,20 @@ type dnsPrefillOptions struct {
 	ttl     time.Duration
 }
 
-const dnsPrefillWorkerLimit = 2
+const (
+	dnsPrefillWorkerLimit = 2
+	dnsPrefillQueueLimit  = 16
+	dnsPrefillQueueMaxAge = 5 * time.Second
+)
+
+type dnsPrefillWork struct {
+	key, tag, domain string
+	addrs            []netip.Addr
+	ttl              time.Duration
+	routeRouter      adapter.Router
+	outbounds        adapter.OutboundManager
+	queuedAt         time.Time
+}
 
 func dnsPrefillOptionsFrom(opts option.EBPFDNSPrefillOptions) dnsPrefillOptions {
 	ttl := time.Duration(opts.TTL)
@@ -98,13 +111,10 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 		return
 	}
 	key := dnsPrefillTaskKey(domain, addrs, ttl)
-	if !i.acquireDNSPrefillSlot(key) {
-		return
-	}
-	go func() {
-		defer i.releaseDNSPrefillWorker(key)
-		i.dnsPrefillApply(tag, domain, addrs, ttl, routeRouter, outbounds)
-	}()
+	i.scheduleDNSPrefillWork(dnsPrefillWork{
+		key: key, tag: tag, domain: domain, addrs: addrs, ttl: ttl,
+		routeRouter: routeRouter, outbounds: outbounds, queuedAt: time.Now(),
+	})
 }
 
 func (i *Inbound) acquireDNSPrefillLifecycle() bool {
@@ -129,37 +139,59 @@ func dnsPrefillTaskKey(domain string, addresses []netip.Addr, ttl time.Duration)
 		ttl.String() + "\x00" + strings.Join(parts, "\x00")
 }
 
-func (i *Inbound) acquireDNSPrefillSlot(key string) bool {
+// scheduleDNSPrefillWork never waits on DNS Exchange. Two workers handle live
+// work; short bursts may occupy at most 16 pending slots.
+func (i *Inbound) scheduleDNSPrefillWork(work dnsPrefillWork) bool {
+	if work.queuedAt.IsZero() {
+		work.queuedAt = time.Now()
+	}
 	i.dnsPrefillAccess.Lock()
 	defer i.dnsPrefillAccess.Unlock()
 	if i.dnsPrefillClosed.Load() {
 		return false
 	}
-	if key != "" {
-		if _, exists := i.dnsPrefillInflight[key]; exists {
-			i.dnsPrefillCoalesced.Add(1)
-			return false
-		}
+	if _, exists := i.dnsPrefillInflight[work.key]; exists {
+		i.dnsPrefillCoalesced.Add(1)
+		return false
 	}
 	if i.dnsPrefillSlots == nil {
 		i.dnsPrefillSlots = make(chan struct{}, dnsPrefillWorkerLimit)
 	}
-	select {
-	case i.dnsPrefillSlots <- struct{}{}:
-		if key != "" {
-			if i.dnsPrefillInflight == nil {
-				i.dnsPrefillInflight = make(map[string]struct{})
-			}
-			i.dnsPrefillInflight[key] = struct{}{}
+	if i.dnsPrefillInflight == nil {
+		i.dnsPrefillInflight = make(map[string]struct{})
+	}
+	// An already waiting dispatcher owns the next free worker slot. New work
+	// joins its queue so a sustained burst cannot starve older observations.
+	if !i.dnsPrefillDispatchWaiting && i.dnsPrefillPendingCount == 0 {
+		select {
+		case i.dnsPrefillSlots <- struct{}{}:
+			i.dnsPrefillInflight[work.key] = struct{}{}
+			i.dnsPrefillAdmitted.Add(1)
+			i.startDNSPrefillWorkerLocked(work, work.ttl)
+			return true
+		default:
 		}
-		// Add while holding the admission lock. StopDNSPrefill takes the same
-		// lock before Wait, so it cannot observe a zero counter and return while
-		// this callback is about to start a worker.
+	}
+	if i.dnsPrefillPendingCount >= dnsPrefillQueueLimit {
+		i.dnsPrefillQueueDrops.Add(1)
+		return false
+	}
+	if i.dnsPrefillPending == nil {
+		i.dnsPrefillPending = make(chan dnsPrefillWork, dnsPrefillQueueLimit)
+		// Close takes this same lock before Wait, so no dispatcher can be added
+		// after the lifecycle barrier has begun.
 		i.dnsPrefillWorkers.Add(1)
+		go i.dispatchDNSPrefillWork(i.dnsPrefillPending)
+	}
+	select {
+	case i.dnsPrefillPending <- work:
+		i.dnsPrefillPendingCount++
+		i.dnsPrefillInflight[work.key] = struct{}{}
 		i.dnsPrefillAdmitted.Add(1)
-		active := i.dnsPrefillActive.Add(1)
-		for peak := i.dnsPrefillPeak.Load(); active > peak; peak = i.dnsPrefillPeak.Load() {
-			if i.dnsPrefillPeak.CompareAndSwap(peak, active) {
+		i.dnsPrefillQueued.Add(1)
+		depth := int64(i.dnsPrefillPendingCount)
+		for peak := i.dnsPrefillQueuePeak.Load(); depth > peak; peak = i.dnsPrefillQueuePeak.Load() {
+			if i.dnsPrefillQueuePeak.CompareAndSwap(peak, depth) {
 				break
 			}
 		}
@@ -170,40 +202,76 @@ func (i *Inbound) acquireDNSPrefillSlot(key string) bool {
 	}
 }
 
+func (i *Inbound) startDNSPrefillWorkerLocked(work dnsPrefillWork, ttl time.Duration) {
+	i.dnsPrefillWorkers.Add(1)
+	active := i.dnsPrefillActive.Add(1)
+	for peak := i.dnsPrefillPeak.Load(); active > peak; peak = i.dnsPrefillPeak.Load() {
+		if i.dnsPrefillPeak.CompareAndSwap(peak, active) {
+			break
+		}
+	}
+	go func() {
+		defer i.releaseDNSPrefillWorker(work.key)
+		i.dnsPrefillApply(work.tag, work.domain, work.addrs, ttl, work.routeRouter, work.outbounds)
+	}()
+}
+
+func (i *Inbound) dispatchDNSPrefillWork(pending <-chan dnsPrefillWork) {
+	defer i.dnsPrefillWorkers.Done()
+	for work := range pending {
+		i.dnsPrefillAccess.Lock()
+		if i.dnsPrefillClosed.Load() {
+			delete(i.dnsPrefillInflight, work.key)
+			i.dnsPrefillPendingCount--
+			i.dnsPrefillAccess.Unlock()
+			continue
+		}
+		i.dnsPrefillDispatchWaiting = true
+		i.dnsPrefillAccess.Unlock()
+
+		// Only this dispatcher waits for capacity. DNS Exchange and its answer
+		// callback have already returned.
+		i.dnsPrefillSlots <- struct{}{}
+		i.dnsPrefillAccess.Lock()
+		i.dnsPrefillDispatchWaiting = false
+		age := time.Since(work.queuedAt)
+		if i.dnsPrefillClosed.Load() || age > dnsPrefillQueueMaxAge {
+			<-i.dnsPrefillSlots
+			delete(i.dnsPrefillInflight, work.key)
+			i.dnsPrefillPendingCount--
+			if !i.dnsPrefillClosed.Load() {
+				i.dnsPrefillExpired.Add(1)
+			}
+			i.dnsPrefillAccess.Unlock()
+			continue
+		}
+		remainingTTL := remainingDNSPrefillTTL(work.ttl, age)
+		i.dnsPrefillPendingCount--
+		i.startDNSPrefillWorkerLocked(work, remainingTTL)
+		i.dnsPrefillAccess.Unlock()
+	}
+}
+
+func remainingDNSPrefillTTL(ttl, age time.Duration) time.Duration {
+	if remaining := ttl - age; remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
 func (i *Inbound) releaseDNSPrefillWorker(key string) {
 	i.dnsPrefillAccess.Lock()
-	if key != "" {
-		delete(i.dnsPrefillInflight, key)
-	}
+	delete(i.dnsPrefillInflight, key)
 	<-i.dnsPrefillSlots
 	i.dnsPrefillActive.Add(-1)
 	i.dnsPrefillAccess.Unlock()
 	i.dnsPrefillWorkers.Done()
 }
 
-// TC observations use their own bounded drain loop; sharing only the in-flight
-// key avoids discarding a strong observation when both paths see one answer.
-func (i *Inbound) claimDNSPrefillObservation(key string) bool {
+func (i *Inbound) dnsPrefillPendingDepth() int {
 	i.dnsPrefillAccess.Lock()
 	defer i.dnsPrefillAccess.Unlock()
-	if i.dnsPrefillClosed.Load() {
-		return false
-	}
-	if _, exists := i.dnsPrefillInflight[key]; exists {
-		i.dnsPrefillCoalesced.Add(1)
-		return false
-	}
-	if i.dnsPrefillInflight == nil {
-		i.dnsPrefillInflight = make(map[string]struct{})
-	}
-	i.dnsPrefillInflight[key] = struct{}{}
-	return true
-}
-
-func (i *Inbound) releaseDNSPrefillObservation(key string) {
-	i.dnsPrefillAccess.Lock()
-	delete(i.dnsPrefillInflight, key)
-	i.dnsPrefillAccess.Unlock()
+	return i.dnsPrefillPendingCount
 }
 
 func (i *Inbound) v3DNSHintEnabled() bool {
@@ -397,6 +465,9 @@ func (i *Inbound) stopDNSPrefill() {
 	}
 	i.dnsPrefillAccess.Lock()
 	i.dnsPrefillClosed.Store(true)
+	if i.dnsPrefillPending != nil {
+		close(i.dnsPrefillPending)
+	}
 	i.dnsPrefillAccess.Unlock()
 	if hub := service.FromContext[*adapter.DNSAnswerObserverHub](i.ctx); hub != nil {
 		hub.Remove(i)
@@ -404,6 +475,12 @@ func (i *Inbound) stopDNSPrefill() {
 	// No new callbacks can enter after unregistering; wait for admitted work so
 	// a restart cannot retain route/outbound references from the old lifecycle.
 	i.dnsPrefillWorkers.Wait()
+	i.dnsPrefillAccess.Lock()
+	i.dnsPrefillPending = nil
+	i.dnsPrefillPendingCount = 0
+	i.dnsPrefillDispatchWaiting = false
+	i.dnsPrefillInflight = nil
+	i.dnsPrefillAccess.Unlock()
 }
 
 // startDNSObservationMonitor drains the optional v3 TC DNS-response map. The
@@ -447,12 +524,9 @@ func (i *Inbound) startDNSObservationMonitor() {
 						return
 					}
 					ttl := dnsObservationPromotionTTL(i.directPromoteTTL(), observation.TTLSeconds)
-					key := dnsPrefillTaskKey(observation.Name, []netip.Addr{observation.Address}, ttl)
-					if !i.claimDNSPrefillObservation(key) {
-						continue
-					}
+					// TC evidence remains authoritative even if an advisory answer
+					// with the same key is still waiting in the queue.
 					i.dnsPrefillApply(i.Tag(), observation.Name, []netip.Addr{observation.Address}, ttl, i.dnsPrefillRouter, i.dnsPrefillOutbounds)
-					i.releaseDNSPrefillObservation(key)
 				}
 			}
 		}

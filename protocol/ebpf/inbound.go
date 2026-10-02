@@ -104,10 +104,13 @@ type Inbound struct {
 	bypassMiss *bypassMissSampler
 	// dnsPrefillPromotes counts successful dns_prefill TC publishes.
 	dnsPrefillPromotes atomic.Uint64
-	// dnsPrefillQueueDrops counts advisory DNS hints dropped while the bounded
-	// async prefill workers are busy. Dropping a hint is fail-open; allowing an
-	// unbounded goroutine burst would make DNS traffic a heap amplifier.
+	// dnsPrefillQueueDrops counts unique advisory hints rejected after both
+	// workers and the bounded pending queue are occupied. DNS resolution itself
+	// still succeeds; an unbounded backlog would amplify heap and stale hints.
 	dnsPrefillQueueDrops  atomic.Uint64
+	dnsPrefillQueued      atomic.Uint64
+	dnsPrefillExpired     atomic.Uint64
+	dnsPrefillQueuePeak   atomic.Int64
 	dnsPrefillFiltered    atomic.Uint64
 	dnsPrefillCoalesced   atomic.Uint64
 	dnsPrefillAdmitted    atomic.Uint64
@@ -126,14 +129,17 @@ type Inbound struct {
 	dnsKernelDirectCIDRs   []netip.Prefix
 
 	// weak dns_prefill (outbound_offload.dns_prefill).
-	dnsPrefill          dnsPrefillOptions
-	dnsPrefillRouter    adapter.Router
-	dnsPrefillOutbounds adapter.OutboundManager
-	dnsPrefillClosed    atomic.Bool // set on Close; async workers check
-	dnsPrefillAccess    sync.Mutex
-	dnsPrefillSlots     chan struct{}
-	dnsPrefillWorkers   sync.WaitGroup
-	dnsPrefillInflight  map[string]struct{}
+	dnsPrefill                dnsPrefillOptions
+	dnsPrefillRouter          adapter.Router
+	dnsPrefillOutbounds       adapter.OutboundManager
+	dnsPrefillClosed          atomic.Bool // set on Close; async workers check
+	dnsPrefillAccess          sync.Mutex
+	dnsPrefillSlots           chan struct{}
+	dnsPrefillPending         chan dnsPrefillWork
+	dnsPrefillPendingCount    int // includes the item currently held by the dispatcher
+	dnsPrefillDispatchWaiting bool
+	dnsPrefillWorkers         sync.WaitGroup
+	dnsPrefillInflight        map[string]struct{}
 
 	// N8: throttle repeated "splice metrics unavailable" warns.
 	spliceStatsErrLogged bool
