@@ -107,7 +107,19 @@ type Inbound struct {
 	// dnsPrefillQueueDrops counts advisory DNS hints dropped while the bounded
 	// async prefill workers are busy. Dropping a hint is fail-open; allowing an
 	// unbounded goroutine burst would make DNS traffic a heap amplifier.
-	dnsPrefillQueueDrops atomic.Uint64
+	dnsPrefillQueueDrops  atomic.Uint64
+	dnsPrefillFiltered    atomic.Uint64
+	dnsPrefillCoalesced   atomic.Uint64
+	dnsPrefillAdmitted    atomic.Uint64
+	dnsPrefillMissingDeps atomic.Uint64
+	dnsPrefillActive      atomic.Int64
+	dnsPrefillPeak        atomic.Int64
+	dnsPrefillEvalCount   atomic.Uint64
+	dnsPrefillEvalNanos   atomic.Uint64
+	dnsPrefillEvalLe1ms   atomic.Uint64
+	dnsPrefillEvalLe5ms   atomic.Uint64
+	dnsPrefillEvalLe20ms  atomic.Uint64
+	dnsPrefillEvalGt20ms  atomic.Uint64
 
 	// dns_kernel_direct: :53 server CIDR exceptions (empty when disabled).
 	dnsKernelDirectEnabled bool
@@ -121,6 +133,7 @@ type Inbound struct {
 	dnsPrefillAccess    sync.Mutex
 	dnsPrefillSlots     chan struct{}
 	dnsPrefillWorkers   sync.WaitGroup
+	dnsPrefillInflight  map[string]struct{}
 
 	// N8: throttle repeated "splice metrics unavailable" warns.
 	spliceStatsErrLogged bool

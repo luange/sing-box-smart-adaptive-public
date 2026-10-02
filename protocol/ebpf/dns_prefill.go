@@ -5,6 +5,8 @@ package ebpf
 import (
 	"context"
 	"net/netip"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -54,36 +56,27 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 	if !i.dnsPrefillIdentitySafe() {
 		return
 	}
-	// FakeIP answers use the shared-network backend synchronously, but they
-	// still need to participate in the same lifecycle barrier as asynchronous
-	// real-DNS prefill work.  Without admission here, Close could clear
-	// sharedNetwork while this callback is publishing hints.
-	if !i.acquireDNSPrefillSlot() {
+	// Hold the lifecycle while checking configuration and dependencies too:
+	// Close may otherwise release sharedNetwork before slot admission.
+	if !i.acquireDNSPrefillLifecycle() {
 		return
 	}
-	release := true
-	defer func() {
-		if release {
-			i.releaseDNSPrefillWorker()
-		}
-	}()
+	defer i.dnsPrefillWorkers.Done()
 	if fromFakeIP {
-		if i.dnsPrefillClosed.Load() {
-			return
-		}
+		// FakeIP is authoritative and must not be discarded because advisory
+		// real-DNS workers have filled their two slots.
 		i.onFakeIPAnswer(addresses)
 		return
 	}
-	// Admit before filtering or allocating. Answers are advisory hints, so a
-	// full worker budget is safely fail-open and cannot create one goroutine per
-	// DNS response during browser/messenger bursts.
+	// Cheap rejection happens before consuming the bounded worker budget.
 	v3DNS := i.v3DNSHintEnabled()
 	if !i.dnsPrefill.enabled && !v3DNS {
+		i.dnsPrefillFiltered.Add(1)
 		return
 	}
-	// Cheap public-IP filter + dedupe before spawning work.
 	addrs := filterPrefillAddresses(addresses)
 	if len(addrs) == 0 {
+		i.dnsPrefillFiltered.Add(1)
 		return
 	}
 	ttl := i.dnsPrefill.ttl
@@ -101,30 +94,75 @@ func (i *Inbound) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP 
 		outbounds = service.FromContext[adapter.OutboundManager](i.ctx)
 	}
 	if routeRouter == nil || outbounds == nil {
+		i.dnsPrefillMissingDeps.Add(1)
 		return
 	}
-	release = false
+	key := dnsPrefillTaskKey(domain, addrs, ttl)
+	if !i.acquireDNSPrefillSlot(key) {
+		return
+	}
 	go func() {
-		defer i.releaseDNSPrefillWorker()
+		defer i.releaseDNSPrefillWorker(key)
 		i.dnsPrefillApply(tag, domain, addrs, ttl, routeRouter, outbounds)
 	}()
 }
 
-func (i *Inbound) acquireDNSPrefillSlot() bool {
+func (i *Inbound) acquireDNSPrefillLifecycle() bool {
 	i.dnsPrefillAccess.Lock()
 	defer i.dnsPrefillAccess.Unlock()
 	if i.dnsPrefillClosed.Load() {
 		return false
+	}
+	i.dnsPrefillWorkers.Add(1)
+	return true
+}
+
+// The TTL is part of the key: a shorter answer must not inherit the lifetime
+// of a concurrent, otherwise identical, longer answer.
+func dnsPrefillTaskKey(domain string, addresses []netip.Addr, ttl time.Duration) string {
+	parts := make([]string, 0, len(addresses))
+	for _, addr := range addresses {
+		parts = append(parts, addr.Unmap().String())
+	}
+	sort.Strings(parts)
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".") + "\x00" +
+		ttl.String() + "\x00" + strings.Join(parts, "\x00")
+}
+
+func (i *Inbound) acquireDNSPrefillSlot(key string) bool {
+	i.dnsPrefillAccess.Lock()
+	defer i.dnsPrefillAccess.Unlock()
+	if i.dnsPrefillClosed.Load() {
+		return false
+	}
+	if key != "" {
+		if _, exists := i.dnsPrefillInflight[key]; exists {
+			i.dnsPrefillCoalesced.Add(1)
+			return false
+		}
 	}
 	if i.dnsPrefillSlots == nil {
 		i.dnsPrefillSlots = make(chan struct{}, dnsPrefillWorkerLimit)
 	}
 	select {
 	case i.dnsPrefillSlots <- struct{}{}:
+		if key != "" {
+			if i.dnsPrefillInflight == nil {
+				i.dnsPrefillInflight = make(map[string]struct{})
+			}
+			i.dnsPrefillInflight[key] = struct{}{}
+		}
 		// Add while holding the admission lock. StopDNSPrefill takes the same
 		// lock before Wait, so it cannot observe a zero counter and return while
 		// this callback is about to start a worker.
 		i.dnsPrefillWorkers.Add(1)
+		i.dnsPrefillAdmitted.Add(1)
+		active := i.dnsPrefillActive.Add(1)
+		for peak := i.dnsPrefillPeak.Load(); active > peak; peak = i.dnsPrefillPeak.Load() {
+			if i.dnsPrefillPeak.CompareAndSwap(peak, active) {
+				break
+			}
+		}
 		return true
 	default:
 		i.dnsPrefillQueueDrops.Add(1)
@@ -132,14 +170,40 @@ func (i *Inbound) acquireDNSPrefillSlot() bool {
 	}
 }
 
-func (i *Inbound) releaseDNSPrefillWorker() {
+func (i *Inbound) releaseDNSPrefillWorker(key string) {
 	i.dnsPrefillAccess.Lock()
-	slots := i.dnsPrefillSlots
-	i.dnsPrefillAccess.Unlock()
-	if slots != nil {
-		<-slots
+	if key != "" {
+		delete(i.dnsPrefillInflight, key)
 	}
+	<-i.dnsPrefillSlots
+	i.dnsPrefillActive.Add(-1)
+	i.dnsPrefillAccess.Unlock()
 	i.dnsPrefillWorkers.Done()
+}
+
+// TC observations use their own bounded drain loop; sharing only the in-flight
+// key avoids discarding a strong observation when both paths see one answer.
+func (i *Inbound) claimDNSPrefillObservation(key string) bool {
+	i.dnsPrefillAccess.Lock()
+	defer i.dnsPrefillAccess.Unlock()
+	if i.dnsPrefillClosed.Load() {
+		return false
+	}
+	if _, exists := i.dnsPrefillInflight[key]; exists {
+		i.dnsPrefillCoalesced.Add(1)
+		return false
+	}
+	if i.dnsPrefillInflight == nil {
+		i.dnsPrefillInflight = make(map[string]struct{})
+	}
+	i.dnsPrefillInflight[key] = struct{}{}
+	return true
+}
+
+func (i *Inbound) releaseDNSPrefillObservation(key string) {
+	i.dnsPrefillAccess.Lock()
+	delete(i.dnsPrefillInflight, key)
+	i.dnsPrefillAccess.Unlock()
 }
 
 func (i *Inbound) v3DNSHintEnabled() bool {
@@ -197,6 +261,22 @@ func (i *Inbound) dnsPrefillApply(
 	routeRouter adapter.Router,
 	outbounds adapter.OutboundManager,
 ) {
+	start := time.Now()
+	defer func() {
+		elapsed := time.Since(start)
+		i.dnsPrefillEvalCount.Add(1)
+		i.dnsPrefillEvalNanos.Add(uint64(elapsed))
+		switch {
+		case elapsed <= time.Millisecond:
+			i.dnsPrefillEvalLe1ms.Add(1)
+		case elapsed <= 5*time.Millisecond:
+			i.dnsPrefillEvalLe5ms.Add(1)
+		case elapsed <= 20*time.Millisecond:
+			i.dnsPrefillEvalLe20ms.Add(1)
+		default:
+			i.dnsPrefillEvalGt20ms.Add(1)
+		}
+	}()
 	if i.dnsPrefillClosed.Load() {
 		return
 	}
@@ -367,7 +447,12 @@ func (i *Inbound) startDNSObservationMonitor() {
 						return
 					}
 					ttl := dnsObservationPromotionTTL(i.directPromoteTTL(), observation.TTLSeconds)
+					key := dnsPrefillTaskKey(observation.Name, []netip.Addr{observation.Address}, ttl)
+					if !i.claimDNSPrefillObservation(key) {
+						continue
+					}
 					i.dnsPrefillApply(i.Tag(), observation.Name, []netip.Addr{observation.Address}, ttl, i.dnsPrefillRouter, i.dnsPrefillOutbounds)
+					i.releaseDNSPrefillObservation(key)
 				}
 			}
 		}
