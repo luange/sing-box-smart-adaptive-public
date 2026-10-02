@@ -2,7 +2,7 @@
 
 基于 **[SagerNet/sing-box](https://github.com/SagerNet/sing-box)** 官方 1.14 稳定线(基线 `v1.14.9` 之后,当前发布 `v1.14.x`)的定制核心。
 
-**策略：纯官方基底 + 自有一等公民能力，不做 reF1nd 整树覆盖。**
+面向 Linux 网关的 sing-box 扩展，提供 Smart 出站选择、订阅节点组与 eBPF 透明路由能力。
 
 | | |
 |--|--|
