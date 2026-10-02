@@ -1,0 +1,172 @@
+name: v1.14.0 global audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "protocol/group/**"
+      - "protocol/ebpf/**"
+      - "common/ebpf/**"
+      - "experimental/**"
+      - "provider/parser/**"
+      - "provider/**"
+      - "adapter/provider/**"
+      - "option/provider.go"
+      - "option/group.go"
+      - "constant/provider.go"
+      - "include/registry.go"
+      - "route/rule/**"
+      - "daemon/**"
+      - "smart-engine/**"
+      - "xdp-engine/**"
+      - ".github/workflows/rc4-global-audit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ebpf-provenance:
+    name: Generate and validate eBPF v2/v3 objects on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Install eBPF build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm make linux-libc-dev
+      - name: Verify generated eBPF provenance
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
+          # Objects are generated on Linux because macOS cannot build the BPF
+          # target.  The source-hash checks below run after generation and the
+          # resulting objects are uploaded for the source tree when needed.
+          make generate
+          make check-v2-source
+          make check-v3-source
+      - name: Validate generated v2/v3 objects
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
+          test -s native/shared_network_v2.bpf.o
+          test -s v3/kern/tc.bpf.o
+          readelf -S v3/kern/tc.bpf.o | grep -E '(\.maps|\.BTF|\.BTF\.ext|classifier/ingress|\.sb\.source)'
+          # The DNS observation map must be present in the generated object;
+          # otherwise the userspace drain path would be a silent no-op.
+          readelf -s v3/kern/tc.bpf.o | grep -F 'v3_dns_observe'
+      - name: Publish regenerated object
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1.14.0-ebpf-objects
+          path: |
+            common/ebpf/native/shared_network_v2.bpf.o
+            common/ebpf/v3/kern/tc.bpf.o
+          if-no-files-found: error
+
+  go-regression:
+    name: Smart and eBPF regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Focused tests
+        run: |
+          make -C common/ebpf generate
+          CGO_ENABLED=1 go test -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+      - name: Race tests for stateful paths
+        run: CGO_ENABLED=1 go test -race -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+      - name: Static checks
+        run: CGO_ENABLED=1 go vet -tags with_ebpf ./protocol/group/... ./protocol/ebpf/... ./common/ebpf/...
+
+  full-go-regression:
+    name: Full Go regression and vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Full tests
+        run: go test ./...
+      - name: Full static checks
+        run: go vet ./...
+      - name: Full eBPF-tagged tests
+        run: |
+          make -C common/ebpf generate
+          CGO_ENABLED=1 go test -tags with_ebpf ./...
+
+  protocol-matrix:
+    name: All protocol feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Compile and test every protocol family
+        run: |
+          set -euo pipefail
+          tags="$(tr -d ' \n' < release/DEFAULT_BUILD_TAGS_OTHERS)"
+          # This is intentionally the full upstream feature set, not the
+          # smaller gateway release profile. It catches protocol-specific
+          # build and initialization regressions before Smart is packaged.
+          CGO_ENABLED=1 go test -tags "$tags" ./protocol/...
+          CGO_ENABLED=1 go vet -tags "$tags" ./protocol/...
+      - name: Run Smart protocol marker matrix
+        run: go test ./protocol/group -run 'TestSmart(ObservedConnClassifiesProtocolHandshakeFailures|StatusExposesPolicyBackendContract)$'
+
+  smart-zig:
+    name: Smart Zig conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Smart engine tests and Linux libraries
+        working-directory: smart-engine
+        run: |
+          zig build test -Dcpu=baseline
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+
+  schema:
+    name: Provider schema coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Generate schema on Linux
+        run: |
+          set -euo pipefail
+          go run -ldflags "$(cat release/LDFLAGS)" --tags "$(tr -d ' \n' < release/DEFAULT_BUILD_TAGS_OTHERS)" ./cmd/sing-box schema -o /tmp/schema.json
+          test -s /tmp/schema.json
+          # Provider and group membership filters must be visible to editor
+          # tooling as well as accepted by the runtime decoder.  Match the
+          # JSON contract, not Go's generated definition names.
+          grep -q '"providers"' /tmp/schema.json
+          grep -q '"use_all_providers"' /tmp/schema.json
+          grep -q '"include"' /tmp/schema.json
+          grep -q '"exclude"' /tmp/schema.json
+      - name: Upload generated schema
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v1.14.0-provider-schema
+          path: /tmp/schema.json
+          if-no-files-found: error

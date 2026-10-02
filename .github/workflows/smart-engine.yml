@@ -1,0 +1,114 @@
+name: Smart engine
+
+on:
+  push:
+    paths:
+      - "smart-engine/**"
+      - "docs/smart-engine-architecture.md"
+      - ".github/workflows/smart-engine.yml"
+  pull_request:
+    paths:
+      - "smart-engine/**"
+      - "docs/smart-engine-architecture.md"
+      - ".github/workflows/smart-engine.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zig:
+    name: Zig policy core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Test
+        working-directory: smart-engine
+        run: zig build test -Dcpu=baseline
+      - name: Build release library
+        working-directory: smart-engine
+        run: zig build -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Exercise C ABI
+        working-directory: smart-engine
+        run: |
+          cat > /tmp/smart_engine_abi.c <<'EOF'
+          #include "smart_engine.h"
+          #include <stddef.h>
+          int main(void) {
+            if (smart_engine_abi_version() != SMART_ENGINE_ABI_VERSION) return 1;
+            smart_engine_config cfg = {0};
+            cfg.switch_confirm_samples = 2;
+            smart_engine *engine = smart_engine_create(cfg);
+            if (!engine) return 2;
+            smart_candidate incumbent = {1, .9, 20, 20, 1, 0, 4, 1, 0, 1, 1};
+            smart_candidate better = {2, .99, 5, 5, 1, 0, 4, 1, 0, 1, 1};
+            smart_decision first = smart_engine_choose(engine, &incumbent, 1, 0);
+            smart_engine_set_selected(engine, first.selected_id, 0);
+            smart_candidate candidates[2] = {incumbent, better};
+            smart_decision pending = smart_engine_choose(engine, candidates, 2, 1);
+            smart_decision switched = smart_engine_choose(engine, candidates, 2, 2);
+            if (!(first.selected_id == 1 && pending.selected_id == 1 &&
+                  switched.selected_id == 2 && switched.switched == 1)) return 3;
+            smart_engine_destroy(engine);
+            smart_engine_config balanced_cfg = {0};
+            balanced_cfg.switch_margin = 0.20;
+            balanced_cfg.switch_confirm_samples = 1;
+            balanced_cfg.affinity_seed = 0x1234;
+            balanced_cfg.selection_mode = 1;
+            balanced_cfg.site_stickiness_ms = 60000;
+            smart_engine *balanced = smart_engine_create(balanced_cfg);
+            if (!balanced) return 4;
+            smart_decision spread_a = smart_engine_choose(balanced, candidates, 2, 0);
+            smart_decision spread_b = smart_engine_choose(balanced, candidates, 2, 1);
+            smart_engine_set_selected(balanced, spread_a.selected_id, 1);
+            smart_decision sticky = smart_engine_choose(balanced, candidates, 2, 2);
+            if (sticky.selected_id != spread_a.selected_id || sticky.switched != 0) return 5;
+            smart_engine_destroy(balanced);
+            smart_engine_config threshold_cfg = {0};
+            threshold_cfg.switch_confirm_samples = 1;
+            threshold_cfg.switch_min_improvement_ms = 100;
+            smart_engine *threshold = smart_engine_create(threshold_cfg);
+            if (!threshold) return 6;
+            smart_candidate slow = {3, .99, 200, 200, 1, 0, 8, 1, 0, 1, 1};
+            smart_candidate near = {4, .99, 150, 150, 1, 0, 8, 1, 0, 1, 1};
+            smart_decision threshold_first = smart_engine_choose(threshold, &slow, 1, 0);
+            smart_engine_set_selected(threshold, threshold_first.selected_id, 0);
+            smart_candidate threshold_candidates[2] = {slow, near};
+            smart_decision threshold_result = smart_engine_choose(threshold, threshold_candidates, 2, 1);
+            smart_engine_destroy(threshold);
+            if (threshold_first.selected_id != 3 || threshold_result.selected_id != 3 || threshold_result.switched != 0) return 7;
+            return spread_a.selected_id != 0 && spread_a.selected_id == spread_b.selected_id ? 0 : 8;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -I include /tmp/smart_engine_abi.c zig-out/lib/libsmart_engine.a -lm -o /tmp/smart_engine_abi
+          /tmp/smart_engine_abi
+      - name: Go/Zig conformance
+        working-directory: smart-engine
+        run: CGO_ENABLED=1 go test -tags smart_zig ./conformance
+      - name: Compile production Smart Zig backend
+        run: |
+          set -euo pipefail
+          cd smart-engine
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          test -s zig-out/lib/libsmart_engine.a
+          cd ..
+          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
+      - name: Run Smart and transport regression tests
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group ./transport/v2raywebsocket
+      - name: Cross-build Linux libraries
+        working-directory: smart-engine
+        run: |
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Check C ABI header
+        working-directory: smart-engine
+        run: |
+          printf '#include "smart_engine.h"\nint main(void) { return smart_engine_abi_version() == SMART_ENGINE_ABI_VERSION ? 0 : 1; }\n' > /tmp/smart_engine_abi.c
+          cc -std=c11 -Wall -Wextra -Werror -I include -c /tmp/smart_engine_abi.c -o /tmp/smart_engine_abi.o

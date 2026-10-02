@@ -1,0 +1,246 @@
+name: Release Linux Binaries
+
+# Gateway eBPF builds for amd64/arm64 on glibc and musl.
+# Trigger: a plain SemVer tag (vMAJOR.MINOR.PATCH) or manual dispatch.
+
+on:
+  push:
+    tags:
+      # Capabilities belong to build metadata; release tags stay SemVer.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer without v (for example 1.14.0 or 1.14.1)"
+        required: true
+        type: string
+      publish_release:
+        description: "Upload GitHub Release assets"
+        required: false
+        type: boolean
+        default: true
+
+# Release-mode matrix jobs need repository write permission because they upload
+# directly to GitHub Releases instead of the quota-limited artifact service.
+permissions:
+  # Release-mode matrix jobs upload their assets directly to the repository
+  # release. This avoids the separate Actions artifact storage quota.
+  contents: write
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Check SemVer
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$REQUESTED_VERSION"
+          fi
+          .github/validate-version.sh "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ebpf:
+    name: ebpf linux/${{ matrix.goarch }}/${{ matrix.libc }}
+    needs: [validate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+        libc: [glibc, musl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Install build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm make pkg-config libelf-dev zlib1g-dev linux-libc-dev
+          if [[ "${{ matrix.goarch }}" == "arm64" ]]; then
+            sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Validate committed v2 eBPF provenance
+        run: |
+          set -euo pipefail
+          # This runs before generation and verifies the object embedded by
+          # go:embed was produced from the checked-in v2 sources.  It avoids
+          # the stale-object gap without requiring byte identity across the
+          # different Clang toolchains used for release targets.
+          make -C common/ebpf check-v2-source
+
+      - name: Generate eBPF objects
+        run: |
+          set -euo pipefail
+          make -C common/ebpf generate
+          ls -la common/ebpf/native/*.o
+
+      - name: Build Zig Smart policy library
+        working-directory: smart-engine
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            zig_target="x86_64-linux-musl"
+            if [[ "${{ matrix.goarch }}" == "arm64" ]]; then zig_target="aarch64-linux-musl"; fi
+          else
+            zig_target="x86_64-linux-gnu"
+            if [[ "${{ matrix.goarch }}" == "arm64" ]]; then zig_target="aarch64-linux-gnu"; fi
+          fi
+          zig build -Dtarget="$zig_target" -Dcpu=baseline -Doptimize=ReleaseFast
+          test -s zig-out/lib/libsmart_engine.a
+          file zig-out/lib/libsmart_engine.a
+
+      - name: Build eBPF (CGO=1)
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          ver="${{ needs.validate.outputs.version }}"
+          # Gateway release profile: keep only protocols/features used by the
+          # adaptive PBR deployment. Do not inherit the upstream "others"
+          # bundle (OpenVPN, OCM/CCM, Cloudflared and USBIP add size without
+          # being part of this target).
+          tags="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,with_connection_history,with_tailscale,badlinkname,tfogo_checklinkname0,with_ebpf,smart_zig"
+          if [[ ",${tags}," == *",smart_reference,"* || ",${tags}," != *",smart_zig,"* ]]; then
+            echo "production release must enable smart_zig and must not enable smart_reference" >&2
+            exit 1
+          fi
+          tags="${tags},production_smart"
+          ldflags="$(tr -d '\n' < release/LDFLAGS)"
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            target="x86_64-linux-musl"
+            if [[ "$GOARCH" == "arm64" ]]; then target="aarch64-linux-musl"; fi
+            printf '#!/bin/sh\nexec zig cc -target %s "$@"\n' "$target" > /tmp/zig-musl-cc
+            chmod +x /tmp/zig-musl-cc
+            export CC=/tmp/zig-musl-cc
+            tags="${tags},with_musl"
+            extra_ldflags="-extldflags '-static'"
+          elif [[ "$GOARCH" == "arm64" ]]; then
+            export CC=aarch64-linux-gnu-gcc
+            extra_ldflags=""
+          else
+            export CC=gcc
+            extra_ldflags=""
+          fi
+          mkdir -p dist
+          out="dist/sing-box-linux-${GOARCH}-${{ matrix.libc }}-ebpf"
+          go build -trimpath -tags "$tags" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${ver}' ${ldflags} -s -w -buildid= ${extra_ldflags}" \
+            -o "$out" ./cmd/sing-box
+          chmod +x "$out"
+          file "$out" | tee "${out}.file"
+          (ldd "$out" 2>&1 || true) | tee "${out}.ldd" || true
+          (
+            cd dist
+            sha256sum "$(basename "$out")" > "$(basename "$out").sha256"
+          )
+          if [[ "$GOARCH" == "amd64" && "${{ matrix.libc }}" == "glibc" ]]; then
+            "$out" version | tee dist/version-ebpf.txt
+            cat > /tmp/ebpf-check.json <<'EOF'
+          {
+            "log": {"level": "error"},
+            "inbounds": [{
+              "type": "ebpf",
+              "tag": "ebpf-in",
+              "network": ["tcp", "udp"],
+              "dns_mode": "hijack",
+              "shared_network": {"enabled": true, "include_interface": ["eth0"]}
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"final": "direct"}
+          }
+          EOF
+            "$out" check -c /tmp/ebpf-check.json
+          fi
+          ls -lh dist/
+
+      - name: Upload private workflow artifact
+        id: upload_private_artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release }}
+        with:
+          name: ebpf-linux-${{ matrix.goarch }}-${{ matrix.libc }}
+          path: dist/*
+          if-no-files-found: error
+
+      # Actions artifact quotas are account-wide and can remain stale for
+      # hours after cleanup. Keep experimental binaries private and usable by
+      # falling back to a draft release, which is visible only to repository
+      # collaborators and is not listed as a published release.
+      - name: Upload private draft assets when artifact storage is unavailable
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && steps.upload_private_artifact.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="experimental-${GITHUB_RUN_ID}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --target "$GITHUB_SHA" \
+              --title "Experimental build ${GITHUB_RUN_ID}" \
+              --notes "Private CI fallback for workflow run ${GITHUB_RUN_ID}; delete after validation." || true
+          fi
+          for attempt in {1..10}; do
+            gh release view "$tag" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          gh release view "$tag" >/dev/null
+          gh release upload "$tag" dist/* --clobber
+
+      # Matrix runners publish directly. GitHub Release storage is separate
+      # from the exhausted Actions artifact quota, and --clobber makes reruns
+      # idempotent for each architecture/libc asset set.
+      - name: Publish release assets without Actions artifact storage
+        if: ${{ github.event_name == 'push' || inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${{ needs.validate.outputs.version }}"
+          tag="v${ver}"
+          notes="Official SagerNet ${ver%%-*} baseline with first-party Smart, eBPF v3, provider and connection history."
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "sing-box ${ver}" --notes "$notes" $(
+              if [[ "$ver" == *-alpha.* || "$ver" == *-beta.* || "$ver" == *-rc.* ]]; then echo --prerelease; fi
+            ) || true
+          fi
+          for attempt in {1..10}; do
+            gh release view "$tag" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          gh release view "$tag" >/dev/null
+          gh release upload "$tag" dist/* --clobber

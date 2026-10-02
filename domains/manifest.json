@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "source": {
+    "ai_group": "Panabit dnsgrp id=4 (AI)",
+    "non_cn_group": "Panabit dnsgrp id=2 (!CN)",
+    "input_format": "id=<group> dns=<domain-or-pattern>"
+  },
+  "policy": {
+    "owner_precedence": "ai",
+    "dedupe": "case-insensitive exact entries and literal subdomains covered by an AI suffix",
+    "patterns": "entries beginning with ^ are preserved and only exact-deduped"
+  },
+  "counts": {
+    "ai_imported": 119,
+    "ai_managed_additions": 1,
+    "ai_total": 120,
+    "non_cn_imported": 7528,
+    "non_cn_total": 7508,
+    "removed_from_non_cn": 20
+  },
+  "managed_additions": [
+    "api.openai.com"
+  ],
+  "files": {
+    "ai.txt": {
+      "entries": 120,
+      "sha256": "05d693f15945827897bf4a4b6e676997f6508f0b2714dcfb25b0592aabd1fac9"
+    },
+    "non-cn.txt": {
+      "entries": 7508,
+      "sha256": "5ee3ee7c86e00386028c45ea677cfc29ed01e66697b6da7d4936cc8f1ecd827d"
+    },
+    "overlap.tsv": {
+      "entries": 20,
+      "sha256": "571ec7c29ce6df03c1ce1530ec9ebdb339f76cd39df153497bc975baf0e5f5df"
+    }
+  }
+}

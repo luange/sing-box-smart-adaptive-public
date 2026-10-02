@@ -1,0 +1,124 @@
+name: XDP engine
+
+on:
+  push:
+    paths:
+      - "xdp-engine/**"
+      - "common/ebpf/Makefile"
+      - "common/ebpf/v3/kern/**"
+      - "common/ebpf/native/xdp_runtime.c"
+      - "common/ebpf/native/singbox_ebpf.h"
+      - "option/ebpf.go"
+      - "protocol/ebpf/v3/**"
+      - "docs/design/next-gen-xdp.md"
+      - "docs/audits/xdp-originality.md"
+      - "docs/audits/xdp-host-adapter-20260830.md"
+      - ".github/workflows/xdp-engine.yml"
+      - ".github/workflows/rc4-global-audit.yml"
+  pull_request:
+    paths:
+      - "xdp-engine/**"
+      - "common/ebpf/Makefile"
+      - "common/ebpf/v3/kern/**"
+      - "common/ebpf/native/xdp_runtime.c"
+      - "common/ebpf/native/singbox_ebpf.h"
+      - "option/ebpf.go"
+      - "protocol/ebpf/v3/**"
+      - "docs/design/next-gen-xdp.md"
+      - "docs/audits/xdp-originality.md"
+      - "docs/audits/xdp-host-adapter-20260830.md"
+      - ".github/workflows/xdp-engine.yml"
+      - ".github/workflows/rc4-global-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go XDP option migration tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.7
+      - name: Test migration and normalization
+        run: go test ./protocol/ebpf/v3
+
+  zig:
+    name: Zig XDP policy core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Test
+        working-directory: xdp-engine
+        run: zig build test -Dcpu=baseline
+      - name: Build release library
+        working-directory: xdp-engine
+        run: zig build -p zig-out-native -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Cross-build Linux libraries
+        working-directory: xdp-engine
+        run: |
+          zig build -p zig-out-x86_64-linux-gnu -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+          zig build -p zig-out-aarch64-linux-gnu -Dtarget=aarch64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Check exported host-adapter ABI
+        run: |
+          cat > /tmp/xdp-abi-smoke.c <<'EOF'
+          #include "xdp_engine.h"
+          int main(void) {
+            struct sb_xdp_adapter_config c = {0};
+            struct sb_xdp_frame f = {0};
+            struct sb_xdp_adapter_stats s = {0};
+            (void)c; (void)f; (void)s;
+            return 0;
+          }
+          EOF
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+            -I xdp-engine/include /tmp/xdp-abi-smoke.c
+      - name: Publish Linux host-adapter libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-xdp-engine-linux-libs
+          path: |
+            xdp-engine/zig-out-x86_64-linux-gnu/lib/libxdp_engine.a
+            xdp-engine/zig-out-aarch64-linux-gnu/lib/libxdp_engine.a
+            xdp-engine/zig-out-x86_64-linux-gnu/include/xdp_engine.h
+            xdp-engine/zig-out-aarch64-linux-gnu/include/xdp_engine.h
+          if-no-files-found: error
+
+  bpf:
+    name: Linux XDP object and verifier surface
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Generate and validate XDP object
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
+          make xdp-generate
+          make xdp-check check-xdp-source
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only \
+            -I native -I v3/kern native/xdp_runtime.c
+          readelf -h v3/kern/xdp.bpf.o | grep -E 'Class:.*ELF64|Machine:.*BPF'
+          readelf -S v3/kern/xdp.bpf.o | grep -E '\.(maps|BTF|BTF\.ext|xdp|license|sb\.source)'
+      - name: Verify policy boundaries in the object
+        working-directory: common/ebpf
+        run: |
+          set -euo pipefail
+          readelf -s v3/kern/xdp.bpf.o | grep -E 'sb_v3_xdp_ingress|v3_xsk_map|v3_xdp_control'
+          ! grep -nE 'bpf_sk_assign|skb->mark|BPF_FUNC_sk_assign' v3/kern/xdp.bpf.c
+      - name: Publish Linux XDP object for lab validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-v3-xdp-bpf-object
+          path: common/ebpf/v3/kern/xdp.bpf.o
+          if-no-files-found: error

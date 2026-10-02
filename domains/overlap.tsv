@@ -1,0 +1,21 @@
+# non-cn entry	AI owner	reason
+anthropic.com	anthropic.com	exact
+chat.com	chat.com	exact
+chat.openai.com	chat.openai.com	exact
+chatgpt.com	chatgpt.com	exact
+chatgpt.site	chatgpt.site	exact
+claude.ai	claude.ai	exact
+claude.com	claude.com	exact
+cloud.dify.ai	dify.ai	ai_suffix
+deepmind.com	deepmind.com	exact
+dify.ai	dify.ai	exact
+files.oaiusercontent.com	oaiusercontent.com	ai_suffix
+g.ai	g.ai	exact
+grok.com	grok.com	exact
+oaiusercontent.com	oaiusercontent.com	exact
+openai.com	openai.com	exact
+openart.ai	openart.ai	exact
+perplexity.ai	perplexity.ai	exact
+poe.com	poe.com	exact
+sora.com	sora.com	exact
+x.ai	x.ai	exact
