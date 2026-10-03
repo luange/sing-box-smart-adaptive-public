@@ -198,14 +198,24 @@ func TestSmartProbeBudgetDeduplicatesEndpointAliases(t *testing.T) {
 	}
 }
 
-func TestSmartSurgeRegularTestingUsesColdFullThenSixPlusSix(t *testing.T) {
+func TestSmartBackgroundProbeRotatesBoundedColdCatalog(t *testing.T) {
 	candidates := make([]adapter.Outbound, 20)
 	for index := range candidates {
 		candidates[index] = newSmartFakeOutbound("candidate-"+itoaSmall(index), nil)
 	}
 	smart := newTestSmart(candidates...)
-	if selected := smart.selectProbeCandidates(candidates, 1, smartProbeBackground); len(selected) != len(candidates) {
-		t.Fatalf("cold catalog selected %d candidates, want full %d", len(selected), len(candidates))
+	seenCold := make(map[string]struct{}, len(candidates))
+	for range 5 {
+		selected := smart.selectProbeCandidates(candidates, 1, smartProbeBackground)
+		if len(selected) != defaultSmartColdProbeBudget {
+			t.Fatalf("cold catalog selected %d candidates, want %d", len(selected), defaultSmartColdProbeBudget)
+		}
+		for _, candidate := range selected {
+			seenCold[candidate.Tag()] = struct{}{}
+		}
+	}
+	if len(seenCold) != len(candidates) {
+		t.Fatalf("slow cold sweeps covered %d of %d candidates", len(seenCold), len(candidates))
 	}
 	now := time.Now()
 	smart.access.Lock()
@@ -239,6 +249,30 @@ func TestSmartSurgeRegularTestingUsesColdFullThenSixPlusSix(t *testing.T) {
 		if selected[index].Tag() != candidates[index].Tag() {
 			t.Fatalf("most-used slot %d = %q, want %q", index, selected[index].Tag(), candidates[index].Tag())
 		}
+	}
+}
+
+func TestSmartBackgroundProbeFitsSlowCycleDeadline(t *testing.T) {
+	candidates := make([]adapter.Outbound, 32)
+	for index := range candidates {
+		candidates[index] = newSmartFakeOutbound("slow-"+itoaSmall(index), nil)
+	}
+	smart := newTestSmart(candidates...)
+	smart.probeTimeout = 8 * time.Second
+	smart.probeCycleTimeout = 30 * time.Second
+	smart.probeConcurrency = 2
+	seen := make(map[string]struct{}, len(candidates))
+	for range 6 {
+		selected := smart.selectProbeCandidates(candidates, 16, smartProbeBackground)
+		if len(selected) != 6 {
+			t.Fatalf("slow cycle scheduled %d candidates, want capacity 6", len(selected))
+		}
+		for _, candidate := range selected {
+			seen[candidate.Tag()] = struct{}{}
+		}
+	}
+	if len(seen) != len(candidates) {
+		t.Fatalf("rotating slow cycles covered %d of %d candidates", len(seen), len(candidates))
 	}
 }
 

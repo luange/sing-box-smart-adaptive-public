@@ -9,6 +9,18 @@ import (
 
 const groupPassiveFailureTTL = 30 * time.Second
 
+// Shared passive health is process-wide across Smart, URLTest and LoadBalance.
+// Only a protocol/authentication or explicit route/refusal failure proves a
+// credential unusable beyond the destination that produced the error.
+func groupPassiveNodeFailure(err error) bool {
+	switch smartFailureType(err) {
+	case "protocol", "hard_transport":
+		return true
+	default:
+		return false
+	}
+}
+
 // groupProfileIdentity separates the credential-sensitive observation key
 // from the credential-free endpoint admission key. Probes for credentials on
 // one physical path are serialized, while their health results never merge.

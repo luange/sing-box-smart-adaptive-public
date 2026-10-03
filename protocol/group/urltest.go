@@ -354,7 +354,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	if groupPassiveNodeFailure(err) {
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	}
 	key := historyKeyForOutbound(s.outbound, outbound, group.link, network)
 	group.history.DeleteURLTestHistoryKey(key)
 	return nil, err
@@ -380,10 +382,11 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	// UDP failure is transport-scoped passive evidence. Do not erase the
-	// authenticated TCP URL-test observation; suppress this member briefly and
-	// let the next bounded test refresh the control-plane state.
-	group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
+	// A destination-specific UDP timeout does not quarantine a credential used
+	// by unrelated Smart or LoadBalance groups. Hard protocol failures do.
+	if groupPassiveNodeFailure(err) {
+		group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
+	}
 	return nil, err
 }
 

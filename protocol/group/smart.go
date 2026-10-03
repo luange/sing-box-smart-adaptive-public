@@ -48,9 +48,9 @@ import (
 
 const (
 	defaultSmartProbeInterval = 10 * time.Minute
-	// The probe must not depend on a hostname whose DNS is routed through the
-	// very Smart group being measured.  A literal Cloudflare address keeps the
-	// first probe bootstrap-safe; urltest supplies the matching TLS SNI.
+	// The built-in hostname uses the configured bootstrap DNS path. Sites that
+	// need literal-IP bootstrap may set url explicitly; both forms receive an
+	// independent second target unless probe_fallback_url disables it.
 	defaultSmartProbeURL          = "https://www.gstatic.com/generate_204"
 	defaultSmartProbeFallbackURL  = "https://cp.cloudflare.com/generate_204"
 	defaultSmartProbeCycleTimeout = 30 * time.Second
@@ -407,7 +407,7 @@ func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdenti
 		// An active URL test traverses the authenticated proxy path. Its result
 		// therefore belongs to DialIdentity, while registry admission remains
 		// serialized by the credential-free endpoint identity.
-		probeKey: nodeProfileKey(dialIdentity, s.probeURL+"\x00"+N.NetworkTCP, 0),
+		probeKey: nodeProfileKey(dialIdentity, s.probeProfileLink(N.NetworkTCP), 0),
 		weight:   s.nodeWeights.Explain(tag),
 	}
 	if dialIdentity != "" && dialIdentity != tag {
@@ -613,6 +613,9 @@ type Smart struct {
 	policyBackend              smartPolicyBackend
 	policyBackendAccess        sync.RWMutex
 	probeURL                   string
+	probeFallbackURL           string
+	probeTargetAccess          sync.Mutex
+	probeTargetCounters        [2]adapter.SmartProbeTargetStatus
 	probeInterval              time.Duration
 	probeCycleTimeout          time.Duration
 	probeTimeout               time.Duration
@@ -709,8 +712,9 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		return nil, err
 	}
 	probeURL := normalizeSmartProbeURL(options.URL)
-	if probeURL != options.URL && logger != nil {
-		logger.Warn("smart probe URL uses a recursive DNS hostname; using bootstrap-safe probe endpoint")
+	probeFallbackURL, err := normalizeSmartProbeFallbackURL(probeURL, options.ProbeFallbackURL)
+	if err != nil {
+		return nil, err
 	}
 	selectionMode, err := normalizeSmartSelectionMode(options.Mode, options.SelectionMode)
 	if err != nil {
@@ -928,6 +932,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		policyBackend:          policyBackend,
 
 		probeURL:                  probeURL,
+		probeFallbackURL:          probeFallbackURL,
 		probeInterval:             probeInterval,
 		probeCycleTimeout:         probeCycleTimeout,
 		probeTimeout:              probeTimeout,
@@ -964,11 +969,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	return smart, nil
 }
 
-// normalizeSmartProbeURL prevents a cold-start dependency cycle. The legacy
-// gstatic probe is commonly resolved by dns-proxy through Smart itself; when
-// the cache is cold that leaves both the resolver and the health worker waiting
-// on one another. Only the legacy/default target is rewritten. Explicit
-// operator targets remain untouched.
+// normalizeSmartProbeURL supplies the built-in probe when omitted and
+// canonicalizes its legacy spelling. Explicit operator targets are preserved.
 func normalizeSmartProbeURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -981,33 +983,149 @@ func normalizeSmartProbeURL(raw string) string {
 	return defaultSmartProbeURL
 }
 
-// probeURLWithFallback keeps the probe hostname and SNI intact. The fallback
-// is only tried after the primary target fails; a single provider outage is
-// therefore not mistaken for a node outage.
+func normalizeSmartProbeFallbackURL(primary string, configured *string) (string, error) {
+	if configured != nil {
+		fallback := strings.TrimSpace(*configured)
+		if fallback == "" {
+			return "", nil
+		}
+		parsed, err := url.Parse(fallback)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+			return "", E.New("smart probe_fallback_url must be an HTTPS URL")
+		}
+		if fallback == primary {
+			return "", E.New("smart probe_fallback_url must differ from url")
+		}
+		return fallback, nil
+	}
+	if primary == defaultSmartProbeURL {
+		return defaultSmartProbeFallbackURL, nil
+	}
+	return defaultSmartProbeURL, nil
+}
+
+// probeURLWithFallback keeps each target's hostname and SNI intact. A failed
+// primary receives only part of the cycle deadline, reserving time for the
+// independent fallback even when the first URL hangs until its timeout.
 func (s *Smart) probeURLWithFallback(ctx context.Context, candidate adapter.Outbound, family string, shared bool) (uint16, error) {
+	return s.probeTargetsWithFallback(ctx, func(probeCtx context.Context, target string) (uint16, error) {
+		if family != "" {
+			return urltest.URLTestWithNetwork(probeCtx, target, candidate, smartProbeNetwork(family))
+		}
+		if shared && s.probeRegistry != nil {
+			return s.probeRegistry.probe(probeCtx, target, candidate)
+		}
+		return urltest.URLTest(probeCtx, target, candidate)
+	})
+}
+
+func (s *Smart) probeTargetsWithFallback(ctx context.Context, probe func(context.Context, string) (uint16, error)) (uint16, error) {
 	urls := []string{s.probeURL}
-	// Explicit operator targets retain their exact one-target semantics. The
-	// second target is an automatic safeguard only for the built-in probe.
-	if s.probeURL == defaultSmartProbeURL && defaultSmartProbeFallbackURL != s.probeURL {
-		urls = append(urls, defaultSmartProbeFallbackURL)
+	if s.probeFallbackURL != "" && s.probeFallbackURL != s.probeURL {
+		urls = append(urls, s.probeFallbackURL)
 	}
 	var lastErr error
-	for _, target := range urls {
-		var delay uint16
-		var err error
-		if family != "" {
-			delay, err = urltest.URLTestWithNetwork(ctx, target, candidate, smartProbeNetwork(family))
-		} else if shared && s.probeRegistry != nil {
-			delay, err = s.probeRegistry.probe(ctx, target, candidate)
-		} else {
-			delay, err = urltest.URLTest(ctx, target, candidate)
+	for index, target := range urls {
+		if err := ctx.Err(); err != nil {
+			return 0, err
 		}
+		attemptCtx, cancel := smartProbeAttemptContext(ctx, len(urls)-index, s.probeTimeout)
+		delay, err := probe(attemptCtx, target)
+		cancel()
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return 0, ctx.Err()
+		}
+		s.noteProbeTargetResult(index, target, err)
 		if err == nil {
 			return delay, nil
 		}
 		lastErr = err
 	}
 	return 0, lastErr
+}
+
+func smartProbeAttemptContext(ctx context.Context, remainingTargets int, configuredTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, loaded := ctx.Deadline(); loaded {
+		if remainingTargets <= 1 {
+			return ctx, func() {}
+		}
+		remaining := time.Until(deadline)
+		return context.WithTimeout(ctx, max(time.Millisecond, remaining/time.Duration(remainingTargets)))
+	}
+	if configuredTimeout <= 0 {
+		configuredTimeout = defaultSmartProbeTimeout
+	}
+	return context.WithTimeout(ctx, configuredTimeout)
+}
+
+func smartProbeFailureClass(err error) string {
+	if err == nil {
+		return ""
+	}
+	var networkError net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded), errors.As(err, &networkError) && networkError.Timeout():
+		return "timeout"
+	case strings.Contains(strings.ToLower(err.Error()), "unexpected http response status"):
+		return "http_status"
+	case strings.Contains(strings.ToLower(err.Error()), "tls"), strings.Contains(strings.ToLower(err.Error()), "certificate"):
+		return "tls"
+	default:
+		return "transport"
+	}
+}
+
+func smartProbeTargetHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
+}
+
+func (s *Smart) noteProbeTargetResult(index int, target string, err error) {
+	if index < 0 || index >= len(s.probeTargetCounters) {
+		return
+	}
+	s.probeTargetAccess.Lock()
+	stat := &s.probeTargetCounters[index]
+	stat.TargetHost = smartProbeTargetHost(target)
+	stat.Attempts++
+	if err == nil {
+		stat.Successes++
+	} else {
+		stat.Failures++
+		stat.LastFailureClass = smartProbeFailureClass(err)
+		switch stat.LastFailureClass {
+		case "timeout":
+			stat.Timeouts++
+		case "http_status":
+			stat.HTTPFailures++
+		case "tls":
+			stat.TLSFailures++
+		default:
+			stat.TransportFailures++
+		}
+	}
+	s.probeTargetAccess.Unlock()
+}
+
+func (s *Smart) probeTargetSnapshot() [2]adapter.SmartProbeTargetStatus {
+	s.probeTargetAccess.Lock()
+	result := s.probeTargetCounters
+	s.probeTargetAccess.Unlock()
+	result[0].TargetHost = smartProbeTargetHost(s.probeURL)
+	result[1].TargetHost = smartProbeTargetHost(s.probeFallbackURL)
+	return result
+}
+
+func (s *Smart) probeProfileLink(transport string) string {
+	// A result obtained through a fallback target cannot be reused by another
+	// group that has the same primary but a different fallback contract.
+	if s.probeFallbackURL == "" {
+		return s.probeURL + "\x00" + transport
+	}
+	return s.probeURL + "\x00" + s.probeFallbackURL + "\x00" + transport
 }
 
 func (s *Smart) Start() error {
@@ -1918,23 +2036,37 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int,
 		items = append(items, probeCandidate{candidate: candidate, probeID: probeID, usage: usage, lastProbe: s.probeLastAt[probeID]})
 	}
 	s.access.RUnlock()
+	if len(items) == 0 {
+		return nil
+	}
+	cold := false
 	if purpose == smartProbeBackground {
-		// Surge tests every policy for small/cold catalogs. Once at least 70% of
-		// a large catalog has a test result, refresh exactly six most-used lines
-		// and six least-recently-tested lines.
-		if len(items) < 13 {
-			return candidates
-		}
 		tested := 0
 		for _, item := range items {
 			if !item.lastProbe.IsZero() {
 				tested++
 			}
 		}
-		if float64(tested)/float64(len(items)) < 0.7 {
-			return candidates
+		cold = float64(tested)/float64(len(items)) < 0.7
+		// A cycle has a hard deadline. Returning an entire cold catalog used
+		// to repeatedly time out on its first slow members, starving the tail.
+		// Reserve a small rotating cold batch even when the group is idle, and
+		// never schedule more than its workers can finish at the probe timeout.
+		budget = min(max(budget, defaultSmartColdProbeBudget), s.probeCycleCapacity(), len(items))
+		if !cold {
+			budget = min(budget, 12)
 		}
-		budget = 12
+	} else {
+		budget = min(budget, len(items))
+	}
+	if budget <= 0 {
+		return nil
+	}
+	cursor := s.probeCursor.Add(uint64(budget)) - uint64(budget)
+	start := int(cursor % uint64(len(items)))
+	rotation := make(map[string]int, len(items))
+	for index, item := range items {
+		rotation[item.probeID] = (index + len(items) - start) % len(items)
 	}
 	used := make([]probeCandidate, 0, len(items))
 	for _, item := range items {
@@ -1946,7 +2078,7 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int,
 		if used[i].usage != used[j].usage {
 			return used[i].usage > used[j].usage
 		}
-		return used[i].candidate.Tag() < used[j].candidate.Tag()
+		return rotation[used[i].probeID] < rotation[used[j].probeID]
 	})
 	sort.SliceStable(items, func(i, j int) bool {
 		if !items[i].lastProbe.Equal(items[j].lastProbe) {
@@ -1958,13 +2090,14 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int,
 			}
 			return items[i].lastProbe.Before(items[j].lastProbe)
 		}
-		return items[i].candidate.Tag() < items[j].candidate.Tag()
+		return rotation[items[i].probeID] < rotation[items[j].probeID]
 	})
 	selected := make([]adapter.Outbound, 0, budget)
 	seen := make(map[string]struct{}, budget)
 	usedBudget := min(len(used), max(1, budget/2))
-	if purpose == smartProbeBackground {
-		usedBudget = min(len(used), 6)
+	if cold {
+		// Coverage comes before use-score while most endpoints are unknown.
+		usedBudget = 0
 	}
 	for _, item := range used[:usedBudget] {
 		selected = append(selected, item.candidate)
@@ -1981,6 +2114,22 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int,
 		seen[item.probeID] = struct{}{}
 	}
 	return selected
+}
+
+func (s *Smart) probeCycleCapacity() int {
+	concurrency := s.probeConcurrency
+	if concurrency <= 0 {
+		concurrency = defaultSmartProbeConcurrency
+	}
+	cycle := s.probeCycleTimeout
+	if cycle <= 0 {
+		cycle = defaultSmartProbeCycleTimeout
+	}
+	perCandidate := s.probeTimeout
+	if perCandidate <= 0 {
+		perCandidate = defaultSmartProbeTimeout
+	}
+	return max(1, concurrency*max(1, int(cycle/perCandidate)))
 }
 
 // selectUDPProbeCandidates gives UDP health checks their own bounded coverage
@@ -2355,6 +2504,11 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	status.StreamFailureWakes = s.streamFailureWakes.Load()
 	status.SelectionMismatchTotal = s.selectionMismatchTotal.Load()
 	status.UnobservedConnectionTotal = s.unobservedConnectionTotal.Load()
+	probeTargets := s.probeTargetSnapshot()
+	status.ProbeTargets = append([]adapter.SmartProbeTargetStatus(nil), probeTargets[0])
+	if probeTargets[1].TargetHost != "" {
+		status.ProbeTargets = append(status.ProbeTargets, probeTargets[1])
+	}
 	if failureType := s.lastFailureType.Load(); failureType != nil {
 		status.LastFailureType = *failureType
 	}
@@ -2404,6 +2558,7 @@ func cloneSmartGroupStatus(source adapter.SmartGroupStatus) adapter.SmartGroupSt
 	result := source
 	result.StateCounts = cloneSmartStateCounts(source.StateCounts)
 	result.Candidates = append([]adapter.SmartCandidateStatus(nil), source.Candidates...)
+	result.ProbeTargets = append([]adapter.SmartProbeTargetStatus(nil), source.ProbeTargets...)
 	if source.Contexts != nil {
 		result.Contexts = make([]adapter.SmartContextStatus, len(source.Contexts))
 		for index, contextStatus := range source.Contexts {
@@ -2772,9 +2927,9 @@ func (s *Smart) recoverOpenCandidatesResult(ctx context.Context, candidates []ad
 					if baseTransport == N.NetworkUDP {
 						key = nodeProfileKey(dialIdentity, "udp://dns-health\x00"+transport, 0)
 					} else if probeFamily := smartTransportFamily(transport); probeFamily != "" {
-						key = nodeProfileKey(dialIdentity, s.probeURL+"\x00"+transport, 0)
+						key = nodeProfileKey(dialIdentity, s.probeProfileLink(transport), 0)
 					} else if key == "" {
-						key = nodeProfileKey(dialIdentity, s.probeURL+"\x00"+N.NetworkTCP, 0)
+						key = nodeProfileKey(dialIdentity, s.probeProfileLink(N.NetworkTCP), 0)
 					}
 					var delay uint16
 					delay, err, _ = s.executeProbe(probeCtx, smartProbeRequest{
@@ -3283,6 +3438,7 @@ func (s *Smart) probe(ctx context.Context) (map[string]uint16, error) {
 
 func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[string]uint16, err error) {
 	probePurpose := smartProbePurposeFromContext(ctx)
+	probeStatsBefore := s.probeTargetSnapshot()
 	probePolicy := probePurpose.policy()
 	dashboardProbe := probePolicy.advisory
 	coveragePurpose := smartProbeTransportCoverage
@@ -3332,8 +3488,8 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 		}
 		return tag
 	}
-	if probePurpose == smartProbeBackground {
-		candidates = s.selectProbeCandidates(candidates, max(budget, 1), probePurpose)
+	if probePurpose == smartProbeBackground && budget > 0 {
+		candidates = s.selectProbeCandidates(candidates, budget, probePurpose)
 	} else if budget > 0 && len(candidates) > budget {
 		s.access.RLock()
 		useScoresAvailable := len(s.useScores) > 0
@@ -3582,7 +3738,19 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 		}
 		if commonFailure {
 			if s.logger != nil {
-				s.logger.Warn("smart probe suppressed candidate penalties because every candidate failed")
+				probeStatsAfter := s.probeTargetSnapshot()
+				s.logger.Warn("smart probe suppressed candidate penalties because sampled candidates failed: sampled=", len(candidates),
+					" performed=", summary.performed,
+					" primary=", probeStatsAfter[0].TargetHost,
+					" primary_failures=", probeStatsAfter[0].Failures-probeStatsBefore[0].Failures,
+					" primary_timeouts=", probeStatsAfter[0].Timeouts-probeStatsBefore[0].Timeouts,
+					" primary_http_failures=", probeStatsAfter[0].HTTPFailures-probeStatsBefore[0].HTTPFailures,
+					" fallback=", probeStatsAfter[1].TargetHost,
+					" fallback_failures=", probeStatsAfter[1].Failures-probeStatsBefore[1].Failures,
+					" fallback_timeouts=", probeStatsAfter[1].Timeouts-probeStatsBefore[1].Timeouts,
+					" fallback_http_failures=", probeStatsAfter[1].HTTPFailures-probeStatsBefore[1].HTTPFailures,
+					" fallback_successes=", probeStatsAfter[1].Successes-probeStatsBefore[1].Successes,
+					" last_primary_failure=", probeStatsAfter[0].LastFailureClass)
 			}
 			err = E.New("all smart probes failed; candidate penalties suppressed")
 			return
@@ -3650,7 +3818,7 @@ func (s *Smart) probeTCPFamilies(ctx context.Context, purpose smartProbePurpose,
 		{transport: "tcp/ipv4"},
 		{transport: "tcp/ipv6"},
 	} {
-		key := nodeProfileKey(dialIdentity, s.probeURL+"\x00"+family.transport, 0)
+		key := nodeProfileKey(dialIdentity, s.probeProfileLink(family.transport), 0)
 		startedAt := time.Now()
 		var (
 			delay     uint16
@@ -4001,11 +4169,9 @@ func (s *Smart) observeProbeResult(_ bool, now time.Time, network, site, candida
 }
 
 // observeDataPlaneFailure records a real connection or established-flow
-// failure and immediately quarantines only the affected site/transport. The
-// ordinary breaker still requires repeated evidence, while this short local
-// quarantine makes the next request fail over instead of retrying the same
-// dead incumbent. Probe failures intentionally do not use this path: if the
-// shared probe endpoint is unavailable, candidates must not all be evicted.
+// failure in the affected site's transport portrait. A successful fallback
+// becomes its new incumbent; an isolated timeout remains a site-local stain.
+// Probe failures intentionally do not use this path.
 func (s *Smart) observeDataPlaneFailure(now time.Time, network, site, candidate, transport string, elapsed time.Duration) {
 	s.observeDataPlaneFailureWithType(now, network, site, candidate, transport, elapsed, "transport")
 }
@@ -4016,8 +4182,13 @@ func (s *Smart) observeDataPlaneFailureWithType(now time.Time, network, site, ca
 	// timeout directly into the Zig context made one website failure look like
 	// a group-wide endpoint failure and replaced the primary immediately.
 	s.store.observeDial(now, network, site, profileID, transport, false, elapsed)
-	s.recordSharedDataPlaneEvidence(candidate, transport, false)
-	if s.store != nil && (failureType == "protocol" || failureType == "hard_transport") {
+	nodeFailure := failureType == "protocol" || failureType == "hard_transport"
+	if nodeFailure {
+		// The shared registry also feeds URLTest and LoadBalance. A site-local
+		// timeout must not quarantine this credential for unrelated services.
+		s.recordSharedDataPlaneEvidence(candidate, transport, false)
+	}
+	if s.store != nil && nodeFailure {
 		s.store.openEndpointCircuit(now, network, profileID, transport)
 	}
 	if s.store != nil && s.store.endpointDead(network, profileID, transport, now) {
@@ -4198,7 +4369,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			if baseTransport == N.NetworkTCP && common.Contains(candidate.Network(), N.NetworkTCP) {
 				probeKey := metadata.probeKey
 				if family := smartTransportFamily(transport); family != "" {
-					probeKey = nodeProfileKey(metadata.dialIdentity, s.probeURL+"\x00"+transport, 0)
+					probeKey = nodeProfileKey(metadata.dialIdentity, s.probeProfileLink(transport), 0)
 				}
 				activeProbeDegraded = s.probeRegistry.dead(probeKey)
 			}

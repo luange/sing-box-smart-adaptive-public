@@ -120,26 +120,36 @@ To keep one healthy primary until failure, change only the mode:
 "mode": 0
 ```
 
-The normal configuration does not require any of these policy details: a Smart
-group with only `outbounds`/`providers` uses the built-in probe budget, phase
-transitions, margins, confirmation and cooldown defaults. Advanced fields remain
-compatibility overrides for operators who already use them; the staged startup
-is intentionally internal so a new deployment does not need to guess a
- ”correct” tuning value. The Zig policy backend owns the confirmation state for
-the unified policy. A production release does not silently switch to the host
-adapter.
+The normal configuration does not require policy tuning: a Smart group with
+only `outbounds`/`providers` uses built-in probe budgets and health gates. In
+mode `1`, an established business context also applies the configured switch
+margin, minimum latency improvement, confirmation samples/window and cooldown
+before a performance migration. Mode `0` retains its healthy incumbent and
+does not make performance-driven migrations. The Zig policy backend owns this
+state in production; a release does not silently switch to the host adapter.
 
-TCP and UDP background coverage are independent. TCP uses its used/stale
+Active TCP probes use two independent HTTPS targets by default. A custom
+`url` uses the built-in gstatic URL as its fallback; `probe_fallback_url` can
+replace that target or explicitly disable it with an empty string. The primary
+uses no more than half of the remaining probe deadline when a fallback is
+configured. Smart status exposes per-target attempts, successes and failure
+classes without disclosing a full URL or query string. A hostname probe needs
+an independent bootstrap DNS route; a literal-IP primary remains supported.
+Active results with different fallback target sets have distinct profile keys
+and cannot be mistaken for the same URLTest measurement.
+
+TCP and UDP background coverage are independent. TCP uses a bounded rotating
+cold batch and then its used/stale
 candidate budget, while UDP serializes at most two DNS reachability probes per
 cycle and rotates by never-probed or least-recently-probed EndpointProfile.
 Provider aliases share one UDP budget slot, and a failed attempt advances the
 UDP cursor just like a successful one. Registry cache hits are usable evidence
 for the caller but do not advance fresh UDP coverage, so a large group is
 eventually sampled without creating a probe storm or leaving UDP-only lines in
-an `unknown` state forever. Cold starts use a four-candidate batch, active
-periodic cycles use a bounded sixteen-candidate batch, and idle cycles continue
-with a one-candidate maintenance batch; repeated cycles therefore form a full
-catalog sweep without blocking the first request.
+an `unknown` state forever. Large TCP groups never hand their entire catalog
+to one timed cycle: the selected count is capped by worker concurrency and
+cycle/probe timeouts. Untested candidates get rotating turns even when earlier
+entries are slow; active and idle cycles retain separate budgets.
 
 All Smart active measurements enter one probe executor with an explicit
 purpose. Background portrait maintenance and TCP/UDP family coverage may add

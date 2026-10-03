@@ -40,6 +40,75 @@ func TestNormalizeSmartProbeURLAvoidsRecursiveDNS(t *testing.T) {
 	}
 }
 
+func TestSmartProbeFallbackSelection(t *testing.T) {
+	if got, err := normalizeSmartProbeFallbackURL(defaultSmartProbeURL, nil); err != nil || got != defaultSmartProbeFallbackURL {
+		t.Fatalf("default fallback = %q, %v", got, err)
+	}
+	if got, err := normalizeSmartProbeFallbackURL("https://1.1.1.1/cdn-cgi/trace", nil); err != nil || got != defaultSmartProbeURL {
+		t.Fatalf("explicit primary fallback = %q, %v", got, err)
+	}
+	empty := ""
+	if got, err := normalizeSmartProbeFallbackURL(defaultSmartProbeURL, &empty); err != nil || got != "" {
+		t.Fatalf("explicit single-target mode = %q, %v", got, err)
+	}
+	invalid := "http://example.com/health"
+	if _, err := normalizeSmartProbeFallbackURL(defaultSmartProbeURL, &invalid); err == nil {
+		t.Fatal("non-HTTPS fallback was accepted")
+	}
+}
+
+func TestSmartProbeProfileSeparatesFallbackContracts(t *testing.T) {
+	first := &Smart{probeURL: "https://primary.example/health", probeFallbackURL: "https://backup-a.example/health"}
+	second := &Smart{probeURL: first.probeURL, probeFallbackURL: "https://backup-b.example/health"}
+	firstKey := nodeProfileKey("same-credential", first.probeProfileLink(N.NetworkTCP), 0)
+	secondKey := nodeProfileKey("same-credential", second.probeProfileLink(N.NetworkTCP), 0)
+	if firstKey == secondKey {
+		t.Fatal("distinct fallback targets reused one authenticated probe result")
+	}
+}
+
+func TestSmartProbeFallbackRetainsDeadlineAndReportsFailures(t *testing.T) {
+	smart := &Smart{probeURL: "https://primary.example/health", probeFallbackURL: "https://fallback.example/health", probeTimeout: 400 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	delay, err := smart.probeTargetsWithFallback(ctx, func(attemptCtx context.Context, target string) (uint16, error) {
+		if target == smart.probeURL {
+			<-attemptCtx.Done()
+			return 0, attemptCtx.Err()
+		}
+		return 25, nil
+	})
+	if err != nil || delay != 25 || time.Since(started) >= 400*time.Millisecond {
+		t.Fatalf("fallback did not receive reserved time: delay=%d err=%v elapsed=%v", delay, err, time.Since(started))
+	}
+	status := smart.probeTargetSnapshot()
+	if status[0].TargetHost != "primary.example" || status[0].Timeouts != 1 || status[0].Failures != 1 ||
+		status[1].TargetHost != "fallback.example" || status[1].Successes != 1 {
+		t.Fatalf("probe target evidence lost: %+v", status)
+	}
+	smart.noteProbeTargetResult(0, smart.probeURL, errors.New("unexpected HTTP response status: 403"))
+	if got := smart.probeTargetSnapshot()[0].HTTPFailures; got != 1 {
+		t.Fatalf("HTTP probe rejection class = %d, want 1", got)
+	}
+}
+
+func TestSmartStatusExposesProbeTargetsWithoutFullURLs(t *testing.T) {
+	smart := newTestSmart()
+	smart.probeURL = "https://primary.example/health?token=private"
+	smart.probeFallbackURL = "https://fallback.example/generate_204"
+	smart.noteProbeTargetResult(0, smart.probeURL, errors.New("unexpected HTTP response status: 403"))
+	smart.noteProbeTargetResult(1, smart.probeFallbackURL, nil)
+	status := smart.SmartStatus()
+	if len(status.ProbeTargets) != 2 || status.ProbeTargets[0].TargetHost != "primary.example" ||
+		status.ProbeTargets[0].HTTPFailures != 1 || status.ProbeTargets[1].Successes != 1 {
+		t.Fatalf("probe target status missing: %+v", status.ProbeTargets)
+	}
+	if strings.Contains(fmt.Sprint(status.ProbeTargets), "private") {
+		t.Fatal("probe status leaked the configured URL query")
+	}
+}
+
 type smartFakeOutbound struct {
 	outbound.Adapter
 	dialError error
@@ -662,6 +731,36 @@ func TestSmartDoesNotConsumeOtherGroupPassiveFailure(t *testing.T) {
 	ranks, _, _, _ = smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
 	if len(ranks) != 1 || ranks[0].status.State == "open" {
 		t.Fatalf("shared passive TCP recovery did not restore Smart candidate: %+v", ranks)
+	}
+}
+
+func TestSmartSiteFailureDoesNotQuarantineSharedGroupProfile(t *testing.T) {
+	for _, testCase := range []struct {
+		name, transport string
+	}{
+		{name: "tcp", transport: N.NetworkTCP},
+		{name: "udp", transport: N.NetworkUDP},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := newSmartFakeOutbound("shared-"+testCase.name, nil)
+			smart := newTestSmart(candidate)
+			registry := newNodeProfileRegistry(context.Background())
+			defer registry.close()
+			smart.probeRegistry = registry
+			setSmartCandidateIdentities(smart, map[string]string{candidate.Tag(): candidate.Tag()})
+			key := groupTCPPassiveProfileKey(candidate, testCase.transport)
+			if testCase.transport == N.NetworkUDP {
+				key = groupUDPProfileKey(candidate)
+			}
+			smart.observeDataPlaneFailureWithType(time.Now(), "network", "service:example", candidate.Tag(), testCase.transport, time.Second, "transport")
+			if registry.passiveFailureActive(key) {
+				t.Fatal("one website's timeout quarantined a shared URLTest/LoadBalance credential")
+			}
+			smart.observeDataPlaneFailureWithType(time.Now(), "network", "service:example", candidate.Tag(), testCase.transport, time.Second, "protocol")
+			if !registry.passiveFailureActive(key) {
+				t.Fatal("authoritative protocol failure did not reach shared transport health")
+			}
+		})
 	}
 }
 

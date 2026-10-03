@@ -66,6 +66,14 @@ Smart 用数值 `mode` 显式选择主节点策略：
 省略 `mode` 等同于 `1`。旧配置的字符串 `selection_mode` 仍会兼容解析；新配置只用
 数值 `mode`。
 
+`mode: 1` 的已建立业务上下文只会在改善幅度、最小延迟收益、确认次数与时间窗口、
+冷却期同时满足后进行性能切换；`mode: 0` 不进行性能抢占。冷目录按周期容量有界
+轮转，避免前排慢节点让后排长期没有测速画像。
+
+主动 TCP 探测默认使用两个 HTTPS 目标。自定义 `url` 时，内置 gstatic 地址作为
+备用；可用 `probe_fallback_url` 替换，显式设为空字符串可禁用备用。Smart 状态接口
+仅显示目标主机名与成功/超时/HTTP/TLS/传输失败计数，不输出完整 URL。
+
 ## 构建 tags
 
 生产网关示例见根目录 `README.md`。缺少 `with_ebpf` 则无 TC/maps；缺少 `with_connection_history` 则无 `/history`。

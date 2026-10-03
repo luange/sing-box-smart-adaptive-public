@@ -50,6 +50,10 @@ type LoadBalanceOutboundOptions struct {
 type SmartOutboundOptions struct {
 	GroupCommonOption
 	URL string `json:"url,omitempty"`
+	// ProbeFallbackURL overrides the automatic second target. Set an empty
+	// string explicitly to disable fallback for a deliberately single-target
+	// installation; omission chooses a different built-in target from URL.
+	ProbeFallbackURL *string `json:"probe_fallback_url,omitempty"`
 	// ApplicationFeatureLibrary points to a private Panabit .pdb package or an
 	// extracted directory containing dict.so and dpi.so. sing-box reads the
 	// dictionary and SNI/Host tables as data; vendor code is never executed.
@@ -74,13 +78,16 @@ type SmartOutboundOptions struct {
 	// a successful dial and first write. Smart does not generate traffic.
 	EstablishedStallTimeout badoption.Duration `json:"established_stall_timeout,omitempty"`
 	SiteStickiness          badoption.Duration `json:"site_stickiness,omitempty"`
-	SwitchConfirm           badoption.Duration `json:"switch_confirm,omitempty"`
-	SwitchConfirmSamples    int                `json:"switch_confirm_samples,omitempty"`
-	SwitchCooldown          badoption.Duration `json:"switch_cooldown,omitempty"`
-	SwitchMargin            *float64           `json:"switch_margin,omitempty"`
+	// These performance gates apply to mode 1 after a business context has
+	// successfully dialed its incumbent. Mode 0 is failure-only by design.
+	SwitchConfirm        badoption.Duration `json:"switch_confirm,omitempty"`
+	SwitchConfirmSamples int                `json:"switch_confirm_samples,omitempty"`
+	SwitchCooldown       badoption.Duration `json:"switch_cooldown,omitempty"`
+	SwitchMargin         *float64           `json:"switch_margin,omitempty"`
 	// SwitchMinImprovement is the minimum absolute p95 latency gain required
-	// for a performance-driven switch. Omit/zero uses the 100ms default; hard
-	// failures still fail over immediately.
+	// for a mode-1 performance-driven switch. Omit/zero uses the 250ms default;
+	// mode 0 retains its incumbent until unavailable, and hard failures in both
+	// modes still fail over immediately.
 	SwitchMinImprovement badoption.Duration `json:"switch_min_improvement,omitempty"`
 	Exploration          *float64           `json:"exploration,omitempty"`
 	MinSamples           int                `json:"min_samples,omitempty"`

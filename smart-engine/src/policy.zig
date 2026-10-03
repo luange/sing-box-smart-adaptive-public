@@ -26,10 +26,9 @@ pub fn choose(state: *State, config: model.Config, observations: *const metrics.
 }
 
 pub fn chooseProfile(state: *State, config: model.Config, observations: *const metrics.Store, candidates: []const model.Candidate, now_ms: u64, profile: scoring.TrafficProfile) model.Decision {
-    // ABI v6 lets the host provide the complete Surge A/B/C order after it has
-    // applied registered-domain history, transport capability and URL-test
-    // state. In this mode Zig is the sole production decision owner, but it no
-    // longer adds an incumbent/challenge/cooldown FSM that Surge does not have.
+    // ABI v6 lets the host provide the complete A/B/C order after applying
+    // domain history, transport capability and URL-test state. Zig remains
+    // the sole owner of the incumbent and of mode-1 performance confirmation.
     var ordered_candidate: ?model.Candidate = null;
     var best_order = std.math.inf(f64);
     for (candidates) |candidate| {
@@ -40,35 +39,80 @@ pub fn chooseProfile(state: *State, config: model.Config, observations: *const m
         }
     }
     if (ordered_candidate) |candidate| {
-        // In fixed mode the host-provided A/B/C order is only a cold-start
-        // and failover order.  It must not override the endpoint that already
-        // accepted a real connection: applySurgeOrdering deliberately uses a
-        // per-request seed, so returning its first item here would turn every
-        // parallel browser asset into a possible node migration.  A hard-open
-        // or removed incumbent is intentionally not retained, allowing the
-        // ranked backup to take over.
-        if (config.selection_mode == model.selection_mode_fixed and state.selected_id != 0) {
-            for (candidates) |incumbent| {
-                if (incumbent.id == state.selected_id and incumbent.id != 0 and
-                    incumbent.eligible != 0 and incumbent.state != 4)
+        // Fixed mode keeps an established endpoint until it is open or gone.
+        // Spread mode uses the host order to seed a new business context, but
+        // an established context still needs the configured margin, latency
+        // floor, confirmation samples/window and cooldown before migration.
+        // Otherwise a per-request tie seed silently bypasses every switch
+        // option and can move parallel browser assets across public IPs.
+        var incumbent: ?model.Candidate = null;
+        for (candidates) |current| {
+            if (current.id == state.selected_id and current.id != 0 and current.eligible != 0 and current.state != 4) {
+                incumbent = current;
+                break;
+            }
+        }
+        if (incumbent) |current| {
+            const current_score = if (scoring.isFinite(current.candidate_order) and current.candidate_order > 0)
+                current.candidate_order
+            else
+                best_order;
+            const retained = model.Decision{
+                .selected_id = current.id,
+                .score = current_score,
+                .switched = 0,
+                .reason = @intFromEnum(model.DecisionReason.retained),
+            };
+            if (config.selection_mode == model.selection_mode_fixed or current.id == candidate.id) {
+                state.challenge_id = 0;
+                state.challenge_count = 0;
+                state.challenge_since = 0;
+                return retained;
+            }
+            if (healthTier(candidate.state) > healthTier(current.state)) return retained;
+            if (healthTier(candidate.state) == healthTier(current.state)) {
+                if (config.site_stickiness_ms > 0 and now_ms < state.sticky_until) return retained;
+                var total_samples: f64 = 0;
+                for (candidates) |item| {
+                    if (item.id != 0 and item.eligible != 0 and item.state != 4 and healthTier(item.state) == healthTier(candidate.state) and
+                        item.samples > 0 and scoring.isFinite(item.samples)) total_samples += item.samples;
+                }
+                const selected_score = scoring.score(config, candidate, total_samples, profile);
+                const incumbent_score = scoring.score(config, current, total_samples, profile);
+                const margin = if (config.switch_margin >= 0 and scoring.isFinite(config.switch_margin)) @min(config.switch_margin, 0.95) else 0.0;
+                const improvement = if (incumbent_score > 0) (incumbent_score - selected_score) / incumbent_score else 0;
+                if (!scoring.isFinite(selected_score) or !scoring.isFinite(incumbent_score) or
+                    improvement < margin or !absoluteImprovement(candidate, current, config.switch_min_improvement_ms) or
+                    now_ms < state.cooldown_until)
                 {
-                    return .{
-                        .selected_id = incumbent.id,
-                        .score = if (scoring.isFinite(incumbent.candidate_order) and incumbent.candidate_order > 0)
-                            incumbent.candidate_order
-                        else
-                            best_order,
-                        .switched = 0,
-                        .reason = @intFromEnum(model.DecisionReason.retained),
-                    };
+                    state.challenge_id = 0;
+                    state.challenge_count = 0;
+                    state.challenge_since = 0;
+                    return retained;
+                }
+                if (state.challenge_id != candidate.id or state.challenge_since == 0) {
+                    state.challenge_id = candidate.id;
+                    state.challenge_count = 1;
+                    state.challenge_since = now_ms;
+                    return retained;
+                }
+                state.challenge_count +|= 1;
+                if (state.challenge_count < config.switch_confirm_samples or now_ms -| state.challenge_since < config.switch_confirm_ms) {
+                    return retained;
                 }
             }
+        }
+        state.challenge_id = 0;
+        state.challenge_count = 0;
+        state.challenge_since = 0;
+        if (state.selected_id != 0 and state.selected_id != candidate.id) {
+            state.cooldown_until = now_ms +| config.switch_cooldown_ms;
         }
         return .{
             .selected_id = candidate.id,
             .score = best_order,
             .switched = @intFromBool(state.selected_id != 0 and state.selected_id != candidate.id),
-            .reason = @intFromEnum(model.DecisionReason.best),
+            .reason = @intFromEnum(if (state.selected_id != 0 and state.selected_id != candidate.id) model.DecisionReason.confirmed else model.DecisionReason.best),
         };
     }
     const switch_margin = if (config.switch_margin >= 0 and scoring.isFinite(config.switch_margin)) @min(config.switch_margin, 0.95) else 0.0;
@@ -342,6 +386,93 @@ test "fixed mode retains incumbent over per-request spread order" {
     var failed = candidates;
     failed[1].state = 4;
     const switched = chooseProfile(&state, config, &observations, failed[0..], 2000, .interactive);
+    try std.testing.expectEqual(@as(u64, 2), switched.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), switched.switched);
+}
+
+test "ordered spread mode applies material improvement confirmation and cooldown" {
+    var state = State{ .selected_id = 1 };
+    var observations = metrics.Store{};
+    const config = model.Config{
+        .exploration = 0,
+        .switch_margin = 0.25,
+        .switch_confirm_samples = 3,
+        .switch_confirm_ms = 5000,
+        .switch_cooldown_ms = 20_000,
+        .selection_mode = model.selection_mode_spread,
+        .site_stickiness_ms = 0,
+        .switch_min_improvement_ms = 250,
+        .min_samples = 3,
+    };
+    const candidates = [_]model.Candidate{
+        .{ .id = 2, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 1, .state = 1, .eligible = 1 },
+        .{ .id = 1, .reliability = 0.90, .connect_ms = 800, .first_byte_ms = 800, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 2, .state = 1, .eligible = 1 },
+    };
+    const first = chooseProfile(&state, config, &observations, candidates[0..], 1000, .interactive);
+    try std.testing.expectEqual(@as(u64, 1), first.selected_id);
+    try std.testing.expectEqual(@as(u32, 1), state.challenge_count);
+    const second = chooseProfile(&state, config, &observations, candidates[0..], 2000, .interactive);
+    try std.testing.expectEqual(@as(u64, 1), second.selected_id);
+    const confirmed = chooseProfile(&state, config, &observations, candidates[0..], 6000, .interactive);
+    try std.testing.expectEqual(@as(u64, 2), confirmed.selected_id);
+    try std.testing.expectEqual(@as(u8, 1), confirmed.switched);
+    state.selected_id = 2; // Host commits only after the actual dial succeeds.
+    var reversed = candidates;
+    reversed[0].candidate_order = 2;
+    reversed[0].first_byte_ms = 800;
+    reversed[1].candidate_order = 1;
+    reversed[1].first_byte_ms = 20;
+    const cooling = chooseProfile(&state, config, &observations, reversed[0..], 7000, .interactive);
+    try std.testing.expectEqual(@as(u64, 2), cooling.selected_id);
+}
+
+test "ordered spread mode rejects sub-threshold latency gain" {
+    var state = State{ .selected_id = 1 };
+    var observations = metrics.Store{};
+    const config = model.Config{
+        .exploration = 0,
+        .switch_margin = 0.0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .selection_mode = model.selection_mode_spread,
+        .site_stickiness_ms = 0,
+        .switch_min_improvement_ms = 250,
+        .min_samples = 3,
+    };
+    const candidates = [_]model.Candidate{
+        .{ .id = 2, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 1, .state = 1, .eligible = 1 },
+        .{ .id = 1, .reliability = 0.90, .connect_ms = 100, .first_byte_ms = 100, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 2, .state = 1, .eligible = 1 },
+    };
+    const retained = chooseProfile(&state, config, &observations, candidates[0..], 1000, .interactive);
+    try std.testing.expectEqual(@as(u64, 1), retained.selected_id);
+    try std.testing.expectEqual(@as(u32, 0), state.challenge_count);
+}
+
+test "ordered spread mode holds sticky incumbent but allows healthier failover" {
+    var state = State{ .selected_id = 1, .sticky_until = 10_000 };
+    var observations = metrics.Store{};
+    const config = model.Config{
+        .exploration = 0,
+        .switch_margin = 0,
+        .switch_confirm_samples = 1,
+        .switch_confirm_ms = 0,
+        .switch_cooldown_ms = 0,
+        .selection_mode = model.selection_mode_spread,
+        .site_stickiness_ms = 10_000,
+        .switch_min_improvement_ms = 0,
+        .min_samples = 3,
+    };
+    const candidates = [_]model.Candidate{
+        .{ .id = 2, .reliability = 0.99, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 1, .state = 1, .eligible = 1 },
+        .{ .id = 1, .reliability = 0.90, .connect_ms = 800, .first_byte_ms = 800, .jitter_ms = 1, .throughput_bps = 0, .samples = 20, .weight = 1, .candidate_order = 2, .state = 1, .eligible = 1 },
+    };
+    const retained = chooseProfile(&state, config, &observations, candidates[0..], 1000, .interactive);
+    try std.testing.expectEqual(@as(u64, 1), retained.selected_id);
+    try std.testing.expectEqual(@as(u32, 0), state.challenge_count);
+    var degraded = candidates;
+    degraded[1].state = 3;
+    const switched = chooseProfile(&state, config, &observations, degraded[0..], 2000, .interactive);
     try std.testing.expectEqual(@as(u64, 2), switched.selected_id);
     try std.testing.expectEqual(@as(u8, 1), switched.switched);
 }

@@ -291,7 +291,9 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 		return group.interruptGroup.NewConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	if groupPassiveNodeFailure(err) {
+		group.profileRegistry.recordPassive(groupTCPPassiveProfileKey(outbound, network), false, 0, groupPassiveFailureTTL)
+	}
 	key := historyKeyForOutbound(s.outbound, outbound, group.link, network)
 	group.history.DeleteURLTestHistoryKey(key)
 	go group.CheckOutbounds(true)
@@ -316,10 +318,11 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		return group.interruptGroup.NewPacketConnEx(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	// UDP failure is transport-scoped passive evidence. Keep the TCP URL-test
-	// history intact; only suppress this endpoint for a short UDP cooldown and
-	// let the normal bounded check refresh its control-plane view.
-	group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
+	// Keep TCP history intact and avoid process-wide UDP quarantine for one
+	// destination timeout. Only confirmed node-level failures are shared.
+	if groupPassiveNodeFailure(err) {
+		group.profileRegistry.recordPassive(groupUDPProfileKey(outbound), false, 0, groupPassiveFailureTTL)
+	}
 	go group.CheckOutbounds(true)
 	return nil, err
 }

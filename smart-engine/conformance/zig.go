@@ -17,8 +17,11 @@ func newZigEngine(config Config) *zigEngine {
 	cfg := C.smart_engine_config{
 		exploration: C.double(config.Exploration), switch_margin: C.double(config.SwitchMargin),
 		switch_confirm_samples: C.uint32_t(config.SwitchConfirmSamples), switch_confirm_ms: C.uint64_t(config.SwitchConfirmMS),
-		switch_cooldown_ms: C.uint64_t(config.SwitchCooldownMS),
-		min_samples:        C.uint32_t(config.MinSamples),
+		switch_cooldown_ms:        C.uint64_t(config.SwitchCooldownMS),
+		switch_min_improvement_ms: C.uint64_t(config.SwitchMinImprovementMS),
+		site_stickiness_ms:        C.uint64_t(config.SiteStickinessMS),
+		selection_mode:            C.uint8_t(config.SelectionMode),
+		min_samples:               C.uint32_t(config.MinSamples),
 	}
 	return &zigEngine{ptr: C.smart_engine_create(cfg)}
 }

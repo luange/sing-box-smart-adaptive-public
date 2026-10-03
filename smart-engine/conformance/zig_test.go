@@ -31,6 +31,67 @@ func TestZigMatchesReferenceTransitions(t *testing.T) {
 	}
 }
 
+func TestZigMatchesReferenceOrderedSwitchGates(t *testing.T) {
+	config := Config{
+		SelectionMode: 1, SwitchMargin: .25, SwitchConfirmSamples: 3,
+		SwitchConfirmMS: 5000, SwitchCooldownMS: 20000, SwitchMinImprovementMS: 250,
+	}
+	engine := newZigEngine(config)
+	if engine == nil || engine.ptr == nil {
+		t.Fatal("smart_engine_create returned nil")
+	}
+	defer engine.close()
+	engine.setSelected(1, 1)
+	reference := state{selected: 1}
+	candidates := []Candidate{
+		{ID: 2, Reliability: .99, ConnectMS: 20, FirstByteMS: 20, JitterMS: 1, Samples: 20, Weight: 1, CandidateOrder: 1, State: 1, Eligible: 1},
+		{ID: 1, Reliability: .90, ConnectMS: 800, FirstByteMS: 800, JitterMS: 1, Samples: 20, Weight: 1, CandidateOrder: 2, State: 1, Eligible: 1},
+	}
+	for _, now := range []uint64{1000, 2000, 6000} {
+		want := choose(&reference, config, candidates, now)
+		got := engine.choose(candidates, now)
+		if got.SelectedID != want.SelectedID || got.Switched != want.Switched || got.Reason != want.Reason {
+			t.Fatalf("at %d: Zig=%+v Go=%+v", now, got, want)
+		}
+		if now == 6000 {
+			engine.setSelected(2, now)
+			reference.selected = 2
+		}
+	}
+	candidates[0].CandidateOrder, candidates[1].CandidateOrder = 2, 1
+	candidates[0].FirstByteMS, candidates[1].FirstByteMS = 800, 20
+	want := choose(&reference, config, candidates, 7000)
+	got := engine.choose(candidates, 7000)
+	if got.SelectedID != want.SelectedID || got.Switched != want.Switched || got.Reason != want.Reason {
+		t.Fatalf("cooldown: Zig=%+v Go=%+v", got, want)
+	}
+}
+
+func TestZigMatchesReferenceOrderedStickyHealthBoundary(t *testing.T) {
+	config := Config{SelectionMode: 1, SwitchConfirmSamples: 1, SiteStickinessMS: 10000}
+	engine := newZigEngine(config)
+	if engine == nil || engine.ptr == nil {
+		t.Fatal("smart_engine_create returned nil")
+	}
+	defer engine.close()
+	engine.setSelected(1, 1)
+	reference := state{selected: 1, stickyUntil: 10001}
+	candidates := []Candidate{
+		{ID: 2, Reliability: .99, ConnectMS: 20, FirstByteMS: 20, Samples: 20, Weight: 1, CandidateOrder: 1, State: 1, Eligible: 1},
+		{ID: 1, Reliability: .90, ConnectMS: 800, FirstByteMS: 800, Samples: 20, Weight: 1, CandidateOrder: 2, State: 1, Eligible: 1},
+	}
+	for _, now := range []uint64{1000, 2000} {
+		if now == 2000 {
+			candidates[1].State = 3
+		}
+		want := choose(&reference, config, candidates, now)
+		got := engine.choose(candidates, now)
+		if got.SelectedID != want.SelectedID || got.Switched != want.Switched || got.Reason != want.Reason {
+			t.Fatalf("at %d: Zig=%+v Go=%+v", now, got, want)
+		}
+	}
+}
+
 // TestZigMatchesReferenceScores pins the Zig kernel score to the Go reference
 // formula bit-for-bit across a matrix of candidate shapes (weights, unknown
 // latencies, sample counts, health states). A single eligible candidate makes

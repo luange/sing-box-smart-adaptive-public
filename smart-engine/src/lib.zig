@@ -230,7 +230,7 @@ test "retains incumbent until confirmation" {
     try std.testing.expectEqual(@as(u8, 1), policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 2000).switched);
 }
 
-test "spread host order replaces incumbent confirmation FSM in spread mode" {
+test "spread host order cannot bypass incumbent performance gates" {
     var engine = Engine.init(.{ .exploration = 0, .switch_margin = 0.95, .switch_confirm_samples = 10, .switch_confirm_ms = 60000, .switch_cooldown_ms = 60000, .selection_mode = model.selection_mode_spread });
     engine.state.selected_id = 1;
     const candidates = [_]Candidate{
@@ -238,8 +238,8 @@ test "spread host order replaces incumbent confirmation FSM in spread mode" {
         .{ .id = 2, .reliability = 1, .connect_ms = 20, .first_byte_ms = 20, .jitter_ms = 0, .throughput_bps = 0, .samples = 4, .weight = 1, .candidate_order = 1, .state = 1, .eligible = 1 },
     };
     const decision = policy.choose(&engine.state, engine.config, &engine.observations, &candidates, 1000);
-    try std.testing.expectEqual(@as(u64, 2), decision.selected_id);
-    try std.testing.expectEqual(@as(u8, 1), decision.switched);
+    try std.testing.expectEqual(@as(u64, 1), decision.selected_id);
+    try std.testing.expectEqual(@as(u8, 0), decision.switched);
 }
 
 test "spread is the default selection mode" {

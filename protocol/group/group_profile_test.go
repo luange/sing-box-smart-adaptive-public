@@ -2,14 +2,35 @@ package group
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	N "github.com/sagernet/sing/common/network"
 )
+
+func TestSharedPassiveHealthRequiresNodeLevelFailure(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "site timeout", err: context.DeadlineExceeded},
+		{name: "business rejection", err: errors.New("unexpected HTTP response status: 403")},
+		{name: "protocol frame", err: errors.New("unknown version: 72"), want: true},
+		{name: "route refusal", err: syscall.ECONNREFUSED, want: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := groupPassiveNodeFailure(testCase.err); got != testCase.want {
+				t.Fatalf("shared node failure = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
 
 type sharedProfileTestOutbound struct {
 	adapter.Outbound

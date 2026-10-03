@@ -15,10 +15,10 @@ type Candidate struct {
 type Config struct {
 	Exploration, SwitchMargin float64
 	// 0 = fixed primary/backup, 1 = Surge A/B/C dispersion.
-	SelectionMode                     uint8
-	SwitchConfirmSamples              uint32
-	SwitchConfirmMS, SwitchCooldownMS uint64
-	MinSamples                        uint32
+	SelectionMode                                                               uint8
+	SwitchConfirmSamples                                                        uint32
+	SwitchConfirmMS, SwitchCooldownMS, SwitchMinImprovementMS, SiteStickinessMS uint64
+	MinSamples                                                                  uint32
 }
 
 type Decision struct {
@@ -29,8 +29,8 @@ type Decision struct {
 }
 
 type state struct {
-	selected, challenge, since, cooldown uint64
-	count                                uint32
+	selected, challenge, since, cooldown, stickyUntil uint64
+	count                                             uint32
 }
 
 func isFinite(value float64) bool {
@@ -128,10 +128,42 @@ func scoreProfile(c Config, candidate Candidate, total float64, profile int) flo
 	return math.Max(0, base-exploration) / weightOf(candidate.Weight)
 }
 
+func referenceHealthTier(state uint64) uint8 {
+	switch state {
+	case 1:
+		return 0
+	case 0, 2:
+		return 1
+	case 3:
+		return 2
+	case 5:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func referenceCandidateLatency(candidate Candidate) float64 {
+	if candidate.FirstByteMS > 0 && isFinite(candidate.FirstByteMS) {
+		return candidate.FirstByteMS
+	}
+	if candidate.ConnectMS > 0 && isFinite(candidate.ConnectMS) {
+		return candidate.ConnectMS
+	}
+	return 0
+}
+
+func referenceAbsoluteImprovement(best, current Candidate, minimum uint64) bool {
+	if minimum == 0 {
+		return true
+	}
+	bestLatency, currentLatency := referenceCandidateLatency(best), referenceCandidateLatency(current)
+	return bestLatency > 0 && currentLatency > 0 && currentLatency-bestLatency >= float64(minimum)
+}
+
 func choose(s *state, c Config, candidates []Candidate, now uint64) Decision {
-	// Mirrors policy.zig's pre-ranked candidate block: when the host provides a
-	// 1-based candidate order, it decides before any scoring/FSM logic, with
-	// fixed mode retaining a usable incumbent.
+	// Mirrors policy.zig's ordered mode: the host supplies A/B/C order, while
+	// the backend still owns mode-1 confirmation and cooldown for an incumbent.
 	var orderedCandidate *Candidate
 	bestOrder := math.Inf(1)
 	for i := range candidates {
@@ -145,24 +177,78 @@ func choose(s *state, c Config, candidates []Candidate, now uint64) Decision {
 		}
 	}
 	if orderedCandidate != nil {
-		if c.SelectionMode == 0 && s.selected != 0 {
-			for i := range candidates {
-				incumbent := &candidates[i]
-				if incumbent.ID == s.selected && incumbent.ID != 0 &&
-					incumbent.Eligible != 0 && incumbent.State != 4 {
-					score := bestOrder
-					if isFinite(incumbent.CandidateOrder) && incumbent.CandidateOrder > 0 {
-						score = incumbent.CandidateOrder
+		var incumbent *Candidate
+		for i := range candidates {
+			if candidates[i].ID == s.selected && candidates[i].ID != 0 && candidates[i].Eligible != 0 && candidates[i].State != 4 {
+				incumbent = &candidates[i]
+				break
+			}
+		}
+		if incumbent != nil {
+			currentScore := bestOrder
+			if isFinite(incumbent.CandidateOrder) && incumbent.CandidateOrder > 0 {
+				currentScore = incumbent.CandidateOrder
+			}
+			retained := Decision{SelectedID: incumbent.ID, Score: currentScore, Reason: 1}
+			if c.SelectionMode == 0 || incumbent.ID == orderedCandidate.ID {
+				s.challenge, s.count, s.since = 0, 0, 0
+				return retained
+			}
+			if referenceHealthTier(orderedCandidate.State) > referenceHealthTier(incumbent.State) {
+				return retained
+			}
+			if referenceHealthTier(orderedCandidate.State) == referenceHealthTier(incumbent.State) {
+				if c.SiteStickinessMS > 0 && now < s.stickyUntil {
+					return retained
+				}
+				var total float64
+				for _, item := range candidates {
+					if item.ID != 0 && item.Eligible != 0 && item.State != 4 && referenceHealthTier(item.State) == referenceHealthTier(orderedCandidate.State) && item.Samples > 0 && isFinite(item.Samples) {
+						total += item.Samples
 					}
-					return Decision{SelectedID: incumbent.ID, Score: score, Switched: 0, Reason: 1}
+				}
+				selectedScore := score(c, *orderedCandidate, total)
+				incumbentScore := score(c, *incumbent, total)
+				margin := 0.0
+				if c.SwitchMargin >= 0 && isFinite(c.SwitchMargin) {
+					margin = math.Min(c.SwitchMargin, .95)
+				}
+				improvement := 0.0
+				if incumbentScore > 0 {
+					improvement = (incumbentScore - selectedScore) / incumbentScore
+				}
+				if !isFinite(selectedScore) || !isFinite(incumbentScore) || improvement < margin ||
+					!referenceAbsoluteImprovement(*orderedCandidate, *incumbent, c.SwitchMinImprovementMS) || now < s.cooldown {
+					s.challenge, s.count, s.since = 0, 0, 0
+					return retained
+				}
+				if s.challenge != orderedCandidate.ID || s.since == 0 {
+					s.challenge, s.count, s.since = orderedCandidate.ID, 1, now
+					return retained
+				}
+				if s.count < math.MaxUint32 {
+					s.count++
+				}
+				elapsed := uint64(0)
+				if now >= s.since {
+					elapsed = now - s.since
+				}
+				if s.count < c.SwitchConfirmSamples || elapsed < c.SwitchConfirmMS {
+					return retained
 				}
 			}
 		}
+		s.challenge, s.count, s.since = 0, 0, 0
 		switched := uint8(0)
 		if s.selected != 0 && s.selected != orderedCandidate.ID {
 			switched = 1
+			s.cooldown = now + c.SwitchCooldownMS
 		}
-		return Decision{SelectedID: orderedCandidate.ID, Score: bestOrder, Switched: switched, Reason: 0}
+		reason := uint8(0)
+		if switched != 0 {
+			reason = 2
+		}
+		return Decision{SelectedID: orderedCandidate.ID, Score: bestOrder, Switched: switched, Reason: reason}
 	}
 	d := Decision{Score: 100, Reason: 3}
 	var best *Candidate
