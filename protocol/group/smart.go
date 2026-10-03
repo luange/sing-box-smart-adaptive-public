@@ -1808,10 +1808,12 @@ func (s *Smart) applySurgeOrdering(ranks []smartRank, selectionKey, preferredTag
 		switch {
 		case !rank.eligible || rank.status.State == "open":
 			rank.surgeBand = 3
+		case rank.activeProbeDegraded:
+			// Unknown first-byte cost is represented by score zero. It must not
+			// erase an actual failed active probe for a backup candidate.
+			rank.surgeBand = 2
 		case rank.status.Score == 0 || minScore == 0 || rank.status.Score-minScore <= threshold:
 			rank.surgeBand = 0
-		case rank.activeProbeDegraded:
-			rank.surgeBand = 2
 		default:
 			rank.surgeBand = 1
 		}

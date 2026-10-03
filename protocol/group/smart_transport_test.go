@@ -276,6 +276,18 @@ func TestSmartBackgroundProbeFitsSlowCycleDeadline(t *testing.T) {
 	}
 }
 
+func TestSmartFailedActiveProbeDoesNotBecomeColdTierA(t *testing.T) {
+	smart := &Smart{switchMargin: .25}
+	ranks := []smartRank{
+		{policyID: 1, eligible: true, status: adapter.SmartCandidateStatus{Tag: "healthy", State: "healthy", Score: 300, Weight: 1}},
+		{policyID: 2, eligible: true, activeProbeDegraded: true, status: adapter.SmartCandidateStatus{Tag: "failed-probe", State: "warming", Score: 0, Weight: 1}},
+	}
+	smart.applySurgeOrdering(ranks, "business", "", time.Unix(1, 0))
+	if ranks[0].policyID != 1 || ranks[1].surgeBand != 2 {
+		t.Fatalf("failed cold probe outranked a reachable candidate: %+v", ranks)
+	}
+}
+
 func TestSmartUDPProbeBudgetRotatesWithoutStarvingUnknownCandidates(t *testing.T) {
 	candidates := make([]adapter.Outbound, 6)
 	identities := make(map[string]string, len(candidates))
