@@ -1,11 +1,50 @@
 package urltest
 
 import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
+
+type failedProbeDialer struct {
+	N.Dialer
+	err error
+}
+
+func (d failedProbeDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return nil, d.err
+}
+
+func TestURLTestReportsTargetHTTPStatusWithoutChangingGenericSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	var observation ProbeObservation
+	ctx := WithProbeObserver(context.Background(), func(value ProbeObservation) { observation = value })
+	if _, err := URLTest(ctx, server.URL+"/generate_204", N.SystemDialer); err != nil {
+		t.Fatalf("generic URLTest must retain its connectivity-only contract: %v", err)
+	}
+	if observation.Stage != "target_response" || observation.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("target response stage/status = %+v", observation)
+	}
+}
+
+func TestURLTestReportsUpstreamFailureStage(t *testing.T) {
+	var observation ProbeObservation
+	ctx := WithProbeObserver(context.Background(), func(value ProbeObservation) { observation = value })
+	_, err := URLTest(ctx, "https://probe.example/generate_204", failedProbeDialer{err: &net.DNSError{Err: "temporary failure", Name: "probe.example"}})
+	if err == nil || observation.Stage != "dns" || observation.HTTPStatus != 0 {
+		t.Fatalf("DNS failure was not staged: observation=%+v err=%v", observation, err)
+	}
+}
 
 func TestProbeTLSServerName(t *testing.T) {
 	for _, test := range []struct {

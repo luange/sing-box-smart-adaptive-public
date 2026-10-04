@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +20,42 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/common/observable"
 )
+
+// ProbeObservation describes the stage reached by a real URL test. It is
+// advisory metadata: ordinary URLTest callers retain their delay/error API.
+// A Smart caller can distinguish an upstream proxy rejection from an HTTP
+// response sent by the probe site without parsing an error string.
+type ProbeObservation struct {
+	Stage      string
+	HTTPStatus int
+}
+
+type probeObserverKey struct{}
+
+func WithProbeObserver(ctx context.Context, observer func(ProbeObservation)) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, probeObserverKey{}, observer)
+}
+
+func probeFailureStage(err error, stage string) string {
+	if err == nil {
+		return stage
+	}
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return "dns"
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "unexpected http response status") || strings.Contains(message, "authentication failed") {
+		return "proxy_handshake"
+	}
+	if strings.Contains(message, "tls") || strings.Contains(message, "x509:") || strings.Contains(message, "certificate") {
+		return "tls"
+	}
+	return stage
+}
 
 type HistoryStorage struct {
 	access       sync.RWMutex
@@ -187,6 +225,13 @@ func URLTestWithNetwork(ctx context.Context, link string, detour N.Dialer, netwo
 }
 
 func urlTest(ctx context.Context, link string, detour N.Dialer, network string) (t uint16, err error) {
+	stage := "request"
+	responseStatus := 0
+	defer func() {
+		if observer, ok := ctx.Value(probeObserverKey{}).(func(ProbeObservation)); ok {
+			observer(ProbeObservation{Stage: probeFailureStage(err, stage), HTTPStatus: responseStatus})
+		}
+	}()
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -205,6 +250,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer, network string) 
 		}
 	}
 
+	stage = "proxy_dial"
 	start := time.Now()
 	instance, err := detour.DialContext(ctx, network, M.ParseSocksaddrHostPortStr(hostname, port))
 	if err != nil {
@@ -213,10 +259,19 @@ func urlTest(ctx context.Context, link string, detour N.Dialer, network string) 
 	defer instance.Close()
 	if N.NeedHandshakeForWrite(instance) {
 		start = time.Now()
+		stage = "proxy_handshake"
+	} else {
+		stage = "target_request"
 	}
+	stage = "request"
 	req, err := http.NewRequest(http.MethodHead, link, nil)
 	if err != nil {
 		return
+	}
+	if N.NeedHandshakeForWrite(instance) {
+		stage = "proxy_handshake_or_target"
+	} else {
+		stage = "target_request"
 	}
 	// Prefer the caller's deadline (smart probe is typically 5s). Falling back
 	// to TCPTimeout (15s) made serial smart-group Close exceed FatalStopTimeout.
@@ -257,6 +312,8 @@ func urlTest(ctx context.Context, link string, detour N.Dialer, network string) 
 	if err != nil {
 		return
 	}
+	stage = "target_response"
+	responseStatus = resp.StatusCode
 	resp.Body.Close()
 	firstDelay := uint16(time.Since(start) / time.Millisecond)
 	if resp.Close {
@@ -277,6 +334,7 @@ func urlTest(ctx context.Context, link string, detour N.Dialer, network string) 
 		t = firstDelay
 		return
 	}
+	responseStatus = secondResp.StatusCode
 	secondResp.Body.Close()
 	t = uint16(time.Since(secondStart) / time.Millisecond)
 	return

@@ -225,6 +225,9 @@ func TestSmartBackgroundProbeRotatesBoundedColdCatalog(t *testing.T) {
 	if smart.useScores == nil {
 		smart.useScores = make(map[string]smartUseScore)
 	}
+	if smart.probeAttemptAt == nil {
+		smart.probeAttemptAt = make(map[string]time.Time)
+	}
 	for index, candidate := range candidates {
 		metadata := smart.candidateMetadataByTag[candidate.Tag()]
 		probeID := metadata.identity
@@ -235,7 +238,7 @@ func TestSmartBackgroundProbeRotatesBoundedColdCatalog(t *testing.T) {
 		if profileID == "" {
 			profileID = candidate.Tag()
 		}
-		smart.probeLastAt[probeID] = now.Add(-time.Duration(index) * time.Minute)
+		smart.probeAttemptAt[probeID] = now.Add(-time.Duration(index) * time.Minute)
 		if index < 8 {
 			smart.useScores[profileID] = smartUseScore{Score: float64(20 - index), LastUsed: now}
 		}
@@ -273,6 +276,56 @@ func TestSmartBackgroundProbeFitsSlowCycleDeadline(t *testing.T) {
 	}
 	if len(seen) != len(candidates) {
 		t.Fatalf("rotating slow cycles covered %d of %d candidates", len(seen), len(candidates))
+	}
+}
+
+func TestSmartColdCoverageCadenceAndCompleteRotation(t *testing.T) {
+	candidates := make([]adapter.Outbound, 80)
+	for index := range candidates {
+		candidates[index] = newSmartFakeOutbound("coverage-"+itoaSmall(index), nil)
+	}
+	smart := newTestSmart(candidates...)
+	smart.probeInterval = 10 * time.Minute
+	if got := smart.nextProbeInterval(time.Now()); got != defaultSmartColdCoverageInterval {
+		t.Fatalf("cold coverage interval = %v", got)
+	}
+	for cycle := range 20 {
+		selected := smart.selectProbeCandidates(candidates, 1, smartProbeBackground)
+		if len(selected) != defaultSmartColdProbeBudget {
+			t.Fatalf("cycle %d selected %d candidates", cycle, len(selected))
+		}
+		for _, candidate := range selected {
+			smart.noteCandidateAttempt(candidate.Tag(), time.Now())
+		}
+		attempted, total := smart.probeCoverage()
+		if total != 80 || attempted != (cycle+1)*defaultSmartColdProbeBudget {
+			t.Fatalf("cycle %d coverage = %d/%d", cycle, attempted, total)
+		}
+		if cycle == 17 {
+			if got := smart.nextProbeInterval(time.Now()); got != defaultSmartIdleProbeInterval {
+				t.Fatalf("90%% coverage did not end catch-up cadence: %v", got)
+			}
+		}
+	}
+	status := smart.SmartStatus()
+	if status.ProbeEndpointsAttempted != 80 || status.ProbeEndpointsTotal != 80 || status.ProbeCoveragePercent != 100 {
+		t.Fatalf("status coverage was not exported: %+v", status)
+	}
+}
+
+func TestSmartFailedProbeCountsAsAttemptButNotHealthy(t *testing.T) {
+	candidates := make([]adapter.Outbound, 4)
+	for index := range candidates {
+		candidates[index] = newSmartFakeOutbound("failed-"+itoaSmall(index), errors.New("offline"))
+	}
+	smart := newTestSmart(candidates...)
+	_, _ = smart.probe(context.Background())
+	if attempted, total := smart.probeCoverage(); attempted != 4 || total != 4 {
+		t.Fatalf("failed real probes disappeared from coverage: %d/%d", attempted, total)
+	}
+	status := smart.SmartStatus()
+	if status.StateCounts["healthy"] > 0 {
+		t.Fatalf("failed probes were misreported healthy: %+v", status.StateCounts)
 	}
 }
 

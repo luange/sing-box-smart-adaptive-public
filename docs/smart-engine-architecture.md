@@ -137,6 +137,11 @@ classes without disclosing a full URL or query string. A hostname probe needs
 an independent bootstrap DNS route; a literal-IP primary remains supported.
 Active results with different fallback target sets have distinct profile keys
 and cannot be mistaken for the same URLTest measurement.
+Probe status also records the stage and HTTP status: an upstream proxy HTTP
+rejection is distinct from a response produced by the target. A generate_204
+target must return 204; a target-side 403 causes a fallback attempt but never
+opens the node circuit. A deferred proxy handshake timeout is marked as an
+ambiguous tunnel/target stage until a protocol adapter provides stronger data.
 
 TCP and UDP background coverage are independent. TCP uses a bounded rotating
 cold batch and then its used/stale
@@ -149,7 +154,18 @@ eventually sampled without creating a probe storm or leaving UDP-only lines in
 an `unknown` state forever. Large TCP groups never hand their entire catalog
 to one timed cycle: the selected count is capped by worker concurrency and
 cycle/probe timeouts. Untested candidates get rotating turns even when earlier
-entries are slow; active and idle cycles retain separate budgets.
+entries are slow. Until at least 90% of unique endpoints have a real probe
+attempt, the bounded cold batch repeats at no more than five-minute intervals;
+after that, active and idle cycles retain their normal separate budgets.
+The Smart status reports `probe_endpoints_attempted`, `probe_endpoints_total`
+and `probe_coverage_percent`. Failed attempts count as coverage, not health.
+
+For a mode-0 group that must never start on a deliberately low-priority line,
+`standby_nodes` accepts the same keyword / `=exact` syntax as `exclude_nodes`.
+It keeps those nodes eligible for the last bounded retry after normal attempts
+fail; they cannot win a cold primary selection while a normal candidate is
+available. `node_weights` remains a soft score adjustment and cannot promise
+this strict priority on its own. A manual Pin still overrides standby status.
 
 All Smart active measurements enter one probe executor with an explicit
 purpose. Background portrait maintenance and TCP/UDP family coverage may add

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/nodefilter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group/trafficfamily"
 	"github.com/sagernet/sing/common/buf"
@@ -90,6 +93,33 @@ func TestSmartProbeFallbackRetainsDeadlineAndReportsFailures(t *testing.T) {
 	smart.noteProbeTargetResult(0, smart.probeURL, errors.New("unexpected HTTP response status: 403"))
 	if got := smart.probeTargetSnapshot()[0].HTTPFailures; got != 1 {
 		t.Fatalf("HTTP probe rejection class = %d, want 1", got)
+	}
+}
+
+func TestSmartProbeTargetHTTPRejectionFallsBackWithoutNodePenalty(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusForbidden)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer fallback.Close()
+	smart := &Smart{probeURL: primary.URL + "/generate_204", probeFallbackURL: fallback.URL + "/generate_204"}
+	if _, err := smart.probeTargetsWithFallback(context.Background(), func(ctx context.Context, target string) (uint16, error) {
+		return urltest.URLTest(ctx, target, N.SystemDialer)
+	}); err != nil {
+		t.Fatalf("healthy fallback was not used: %v", err)
+	}
+	status := smart.probeTargetSnapshot()
+	if status[0].TargetHTTPFailures != 1 || status[0].LastFailureStage != "target_response" || status[0].LastHTTPStatus != http.StatusForbidden ||
+		status[1].Successes != 1 || status[1].LastHTTPStatus != http.StatusNoContent {
+		t.Fatalf("target rejection and fallback were conflated: %+v", status)
+	}
+	smart.noteProbeTargetObservation(0, smart.probeURL, errors.New("unexpected HTTP response status: 403"), urltest.ProbeObservation{Stage: "proxy_handshake"})
+	status = smart.probeTargetSnapshot()
+	if status[0].ProxyHandshakeFailures != 1 || status[0].TargetHTTPFailures != 1 || status[0].LastFailureClass != "upstream_http_status" {
+		t.Fatalf("upstream HTTP response was attributed to the target: %+v", status[0])
 	}
 }
 
@@ -761,6 +791,60 @@ func TestSmartSiteFailureDoesNotQuarantineSharedGroupProfile(t *testing.T) {
 				t.Fatal("authoritative protocol failure did not reach shared transport health")
 			}
 		})
+	}
+}
+
+func TestSmartStandbyRuleStaysBehindNormalButRemainsRetryable(t *testing.T) {
+	normal := newSmartFakeOutbound("normal", nil)
+	second := newSmartFakeOutbound("normal-two", nil)
+	third := newSmartFakeOutbound("normal-three", nil)
+	standby := newSmartFakeOutbound("GCore standby", nil)
+	smart := newTestSmart(normal, second, third, standby)
+	smart.maxAttempts = 3
+	matcher, err := nodefilter.New([]string{"GCore"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	smart.standbyNodes = matcher
+	setSmartCandidateIdentities(smart, map[string]string{
+		normal.Tag(): normal.Tag(), second.Tag(): second.Tag(), third.Tag(): third.Tag(), standby.Tag(): standby.Tag(),
+	})
+	metadata := smart.buildCandidateMetadata(standby.Tag(), standby.Tag())
+	if !metadata.standbyOnly {
+		t.Fatal("provider standby rule was not wired into candidate metadata")
+	}
+	ranks := []smartRank{
+		{outbound: standby, policyID: 4, eligible: true, standbyOnly: true, status: adapter.SmartCandidateStatus{Tag: standby.Tag(), State: "warming", Weight: 0.1}},
+		{outbound: normal, policyID: 1, eligible: true, status: adapter.SmartCandidateStatus{Tag: normal.Tag(), State: "warming", Weight: 1}},
+		{outbound: second, policyID: 2, eligible: true, status: adapter.SmartCandidateStatus{Tag: second.Tag(), State: "warming", Weight: 1}},
+		{outbound: third, policyID: 3, eligible: true, status: adapter.SmartCandidateStatus{Tag: third.Tag(), State: "warming", Weight: 1}},
+	}
+	for seed := range 1000 {
+		ordered := append([]smartRank(nil), ranks...)
+		smart.applySurgeOrdering(ordered, "business", "", time.Unix(int64(seed), 0))
+		if ordered[0].standbyOnly || ordered[len(ordered)-1].outbound != standby {
+			t.Fatalf("cold standby won with normal candidates available: %+v", ordered)
+		}
+		attempts := smart.collectDialAttempts(ordered, "network", "service:test", N.NetworkTCP)
+		if len(attempts) != 3 || attempts[0].candidate == standby || attempts[1].candidate == standby || attempts[2].candidate != standby {
+			t.Fatalf("standby did not occupy the final bounded retry: %+v", attempts)
+		}
+	}
+	if !smart.SelectOutbound(standby.Tag()) {
+		t.Fatal("manual pin of standby was rejected")
+	}
+	selected, _, _, _ := smart.rank(context.Background(), N.NetworkTCP, M.Socksaddr{})
+	if len(selected) == 0 || selected[0].outbound != standby {
+		t.Fatalf("manual pin did not override standby priority: %+v", selected)
+	}
+	attempts := smart.collectDialAttempts(selected, "network", "service:test", N.NetworkTCP)
+	if len(attempts) == 0 || attempts[0].candidate != standby {
+		t.Fatalf("pinned standby was not the first dial attempt: %+v", attempts)
+	}
+	unpinOrder := append([]smartRank(nil), ranks...)
+	unpinOrder[0].incumbent = true
+	if got := smartAttemptRankOrder(unpinOrder, 3); len(got) < 1 || got[0] != 0 {
+		t.Fatalf("a standby that became the fixed incumbent was demoted on the next request: %+v", got)
 	}
 }
 

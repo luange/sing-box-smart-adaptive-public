@@ -54,6 +54,10 @@ type SmartOutboundOptions struct {
 	// string explicitly to disable fallback for a deliberately single-target
 	// installation; omission chooses a different built-in target from URL.
 	ProbeFallbackURL *string `json:"probe_fallback_url,omitempty"`
+	// StandbyNodes uses the exclude_nodes keyword / =exact syntax. Matching
+	// members remain available as the last dial attempt, but cannot become a
+	// cold primary while a normal-priority member is available.
+	StandbyNodes badoption.Listable[string] `json:"standby_nodes,omitempty"`
 	// ApplicationFeatureLibrary points to a private Panabit .pdb package or an
 	// extracted directory containing dict.so and dpi.so. sing-box reads the
 	// dictionary and SNI/Host tables as data; vendor code is never executed.

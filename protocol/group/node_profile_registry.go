@@ -613,6 +613,26 @@ func (r *nodeProfileRegistry) runProbeModeInternal(ctx context.Context, endpoint
 		r.access.Unlock()
 		return 0, errSharedNodeProbeDeferred, false
 	}
+	if smartProbeTargetIncident(err) {
+		// An HTTP health target can be rejected by the destination or a
+		// target-specific CONNECT policy. Retain an earlier good portrait and
+		// schedule a bounded retry; never promote this into endpoint-dead state.
+		result := previous
+		result.completedAt = completedAt
+		result.nextProbeAt = completedAt.Add(min(ttl, 5*time.Minute))
+		result.deferred = !previous.success
+		entry.result = result
+		entry.inflight = false
+		close(entry.done)
+		entry.done = nil
+		if endpointKey != "" {
+			done := r.active[endpointKey]
+			delete(r.active, endpointKey)
+			close(done)
+		}
+		r.access.Unlock()
+		return 0, errSharedNodeProbeDeferred, true
+	}
 	var successes, failures uint8
 	if err == nil {
 		successes = min(previous.successes+1, uint8(3))

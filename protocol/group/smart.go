@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -122,10 +123,11 @@ const (
 	// samples a small rotating subset; real traffic wakes a larger bounded
 	// cycle. This keeps large catch-all groups from consuming the same probe
 	// budget as an actively routed regional group.
-	defaultSmartActivityWindow    = 15 * time.Minute
-	defaultSmartIdleProbeInterval = 30 * time.Minute
-	defaultSmartColdProbeBudget   = 4
-	defaultSmartActiveProbeBudget = 16
+	defaultSmartActivityWindow       = 15 * time.Minute
+	defaultSmartIdleProbeInterval    = 30 * time.Minute
+	defaultSmartColdCoverageInterval = 5 * time.Minute
+	defaultSmartColdProbeBudget      = 4
+	defaultSmartActiveProbeBudget    = 16
 	// Status is a control-plane view, not a per-connection accounting stream.
 	// Coalesce identical updates briefly so browser asset fan-out does not make
 	// every dial clone the full candidate snapshot under statusAccess.
@@ -354,6 +356,8 @@ type smartRank struct {
 	eligible             bool
 	passiveThroughputLow bool
 	activeProbeDegraded  bool
+	standbyOnly          bool
+	incumbent            bool
 	siteTainted          bool
 	siteSuccesses        float64
 	siteDelayMS          float64
@@ -372,6 +376,7 @@ type smartCandidateMetadata struct {
 	probeKey     string
 	policyID     uint64
 	weight       nodeweight.Match
+	standbyOnly  bool
 }
 
 // smartEndpointID returns the safe, stable identity exposed by Smart status
@@ -407,8 +412,9 @@ func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdenti
 		// An active URL test traverses the authenticated proxy path. Its result
 		// therefore belongs to DialIdentity, while registry admission remains
 		// serialized by the credential-free endpoint identity.
-		probeKey: nodeProfileKey(dialIdentity, s.probeProfileLink(N.NetworkTCP), 0),
-		weight:   s.nodeWeights.Explain(tag),
+		probeKey:    nodeProfileKey(dialIdentity, s.probeProfileLink(N.NetworkTCP), 0),
+		weight:      s.nodeWeights.Explain(tag),
+		standbyOnly: s.standbyNodes.Match(tag),
 	}
 	if dialIdentity != "" && dialIdentity != tag {
 		metadata.profileID = "dial:" + dialIdentity
@@ -570,6 +576,7 @@ type Smart struct {
 	exclude                *regexp.Regexp
 	include                *regexp.Regexp
 	manualExclude          *nodefilter.Matcher
+	standbyNodes           *nodefilter.Matcher
 	nodeWeights            *nodeweight.Matcher
 	useAllProviders        bool
 
@@ -585,6 +592,7 @@ type Smart struct {
 	performanceCooldown    map[string]time.Time
 	useScores              map[string]smartUseScore
 	probeLastAt            map[string]time.Time
+	probeAttemptAt         map[string]time.Time
 	udpProbeLastAt         map[string]time.Time
 	halfOpen               map[string]struct{}
 	halfOpenActive         int
@@ -702,6 +710,10 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	manualExclude, err := nodefilter.New([]string(options.ExcludeNodes))
 	if err != nil {
 		return nil, err
+	}
+	standbyNodes, err := nodefilter.New([]string(options.StandbyNodes))
+	if err != nil {
+		return nil, E.Cause(err, "smart standby_nodes")
 	}
 	weightRules := make([]nodeweight.Rule, len(options.NodeWeights))
 	for index, rule := range options.NodeWeights {
@@ -909,6 +921,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		manualExclude:   manualExclude,
+		standbyNodes:    standbyNodes,
 		nodeWeights:     nodeWeights,
 		useAllProviders: options.UseAllProviders,
 
@@ -922,6 +935,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		performanceCooldown:    make(map[string]time.Time),
 		useScores:              make(map[string]smartUseScore),
 		probeLastAt:            make(map[string]time.Time),
+		probeAttemptAt:         make(map[string]time.Time),
 		udpProbeLastAt:         make(map[string]time.Time),
 		halfOpen:               make(map[string]struct{}),
 		selectionGeneration:    make(map[string]uint64),
@@ -1030,18 +1044,84 @@ func (s *Smart) probeTargetsWithFallback(ctx context.Context, probe func(context
 			return 0, err
 		}
 		attemptCtx, cancel := smartProbeAttemptContext(ctx, len(urls)-index, s.probeTimeout)
+		var observation urltest.ProbeObservation
+		observed := false
+		attemptCtx = urltest.WithProbeObserver(attemptCtx, func(value urltest.ProbeObservation) {
+			observation = value
+			observed = true
+		})
 		delay, err := probe(attemptCtx, target)
 		cancel()
+		if err == nil && observed && observation.Stage == "target_response" && !smartProbeHTTPStatusAccepted(target, observation.HTTPStatus) {
+			err = smartProbeTargetStatusError{Status: observation.HTTPStatus}
+		}
 		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			return 0, ctx.Err()
 		}
-		s.noteProbeTargetResult(index, target, err)
+		s.noteProbeTargetObservation(index, target, err, observation)
 		if err == nil {
 			return delay, nil
 		}
 		lastErr = err
 	}
 	return 0, lastErr
+}
+
+type smartProbeTargetStatusError struct{ Status int }
+
+func (e smartProbeTargetStatusError) Error() string {
+	return "probe target HTTP status: " + strconv.Itoa(e.Status)
+}
+
+func smartProbeUpstreamHTTPStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	message := strings.ToLower(err.Error())
+	const marker = "unexpected http response status:"
+	index := strings.Index(message, marker)
+	if index < 0 {
+		return 0
+	}
+	fields := strings.Fields(message[index+len(marker):])
+	if len(fields) == 0 {
+		return 0
+	}
+	status, _ := strconv.Atoi(fields[0])
+	return status
+}
+
+func smartProbeTargetIncident(err error) bool {
+	var targetStatus smartProbeTargetStatusError
+	if errors.As(err, &targetStatus) {
+		return true
+	}
+	switch smartProbeUpstreamHTTPStatus(err) {
+	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusUnavailableForLegalReasons:
+		// A CONNECT upstream may refuse the health target while the same node
+		// carries ordinary business. This is target scope, not node evidence.
+		return true
+	default:
+		return false
+	}
+}
+
+func smartProbeHTTPStatusAccepted(target string, status int) bool {
+	if status == 0 {
+		return true // Embedded probes without an HTTP observer keep their contract.
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	switch {
+	case strings.HasSuffix(parsed.Path, "generate_204"):
+		return status == http.StatusNoContent
+	case parsed.Path == "/cdn-cgi/trace":
+		return status == http.StatusOK
+	default:
+		return status >= http.StatusOK && status < http.StatusMultipleChoices
+	}
 }
 
 func smartProbeAttemptContext(ctx context.Context, remainingTargets int, configuredTimeout time.Duration) (context.Context, context.CancelFunc) {
@@ -1062,12 +1142,16 @@ func smartProbeFailureClass(err error) string {
 	if err == nil {
 		return ""
 	}
+	var targetStatus smartProbeTargetStatusError
+	if errors.As(err, &targetStatus) {
+		return "target_http_status"
+	}
 	var networkError net.Error
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded), errors.As(err, &networkError) && networkError.Timeout():
 		return "timeout"
 	case strings.Contains(strings.ToLower(err.Error()), "unexpected http response status"):
-		return "http_status"
+		return "upstream_http_status"
 	case strings.Contains(strings.ToLower(err.Error()), "tls"), strings.Contains(strings.ToLower(err.Error()), "certificate"):
 		return "tls"
 	default:
@@ -1084,6 +1168,10 @@ func smartProbeTargetHost(raw string) string {
 }
 
 func (s *Smart) noteProbeTargetResult(index int, target string, err error) {
+	s.noteProbeTargetObservation(index, target, err, urltest.ProbeObservation{})
+}
+
+func (s *Smart) noteProbeTargetObservation(index int, target string, err error, observation urltest.ProbeObservation) {
 	if index < 0 || index >= len(s.probeTargetCounters) {
 		return
 	}
@@ -1091,15 +1179,33 @@ func (s *Smart) noteProbeTargetResult(index int, target string, err error) {
 	stat := &s.probeTargetCounters[index]
 	stat.TargetHost = smartProbeTargetHost(target)
 	stat.Attempts++
+	if observation.HTTPStatus != 0 {
+		stat.LastHTTPStatus = observation.HTTPStatus
+	} else if status := smartProbeUpstreamHTTPStatus(err); status != 0 {
+		stat.LastHTTPStatus = status
+	}
 	if err == nil {
 		stat.Successes++
 	} else {
 		stat.Failures++
 		stat.LastFailureClass = smartProbeFailureClass(err)
+		stat.LastFailureStage = observation.Stage
+		if stat.LastFailureStage == "" {
+			stat.LastFailureStage = "unknown"
+		}
+		switch stat.LastFailureStage {
+		case "dns":
+			stat.DNSFailures++
+		case "proxy_handshake":
+			stat.ProxyHandshakeFailures++
+		}
 		switch stat.LastFailureClass {
 		case "timeout":
 			stat.Timeouts++
-		case "http_status":
+		case "target_http_status":
+			stat.TargetHTTPFailures++
+			stat.HTTPFailures++
+		case "upstream_http_status":
 			stat.HTTPFailures++
 		case "tls":
 			stat.TLSFailures++
@@ -1361,6 +1467,7 @@ func (s *Smart) Close() error {
 	clear(s.performanceCooldown)
 	clear(s.useScores)
 	clear(s.probeLastAt)
+	clear(s.probeAttemptAt)
 	clear(s.udpProbeLastAt)
 	clear(s.halfOpen)
 	s.halfOpenActive = 0
@@ -1378,6 +1485,7 @@ func (s *Smart) Close() error {
 	s.performanceCooldown = make(map[string]time.Time)
 	s.useScores = make(map[string]smartUseScore)
 	s.probeLastAt = make(map[string]time.Time)
+	s.probeAttemptAt = make(map[string]time.Time)
 	s.udpProbeLastAt = make(map[string]time.Time)
 	s.halfOpen = make(map[string]struct{})
 	s.halfOpenActive = 0
@@ -1789,11 +1897,18 @@ func (s *Smart) applySurgeOrdering(ranks []smartRank, selectionKey, preferredTag
 	if len(ranks) == 0 {
 		return
 	}
+	hasNormal := false
+	for _, rank := range ranks {
+		if rank.eligible && rank.status.State != "open" && !rank.standbyOnly {
+			hasNormal = true
+			break
+		}
+	}
 	minScore := 0.0
 	bestAdjustment := 1.0
 	for index := range ranks {
 		rank := &ranks[index]
-		if !rank.eligible || rank.status.State == "open" || rank.status.Score <= 0 {
+		if !rank.eligible || rank.status.State == "open" || rank.status.Score <= 0 || (hasNormal && rank.standbyOnly) {
 			continue
 		}
 		if minScore == 0 || rank.status.Score < minScore {
@@ -1807,6 +1922,8 @@ func (s *Smart) applySurgeOrdering(ranks []smartRank, selectionKey, preferredTag
 		rank := &ranks[index]
 		switch {
 		case !rank.eligible || rank.status.State == "open":
+			rank.surgeBand = 4
+		case hasNormal && rank.standbyOnly:
 			rank.surgeBand = 3
 		case rank.activeProbeDegraded:
 			// Unknown first-byte cost is represented by score zero. It must not
@@ -1843,6 +1960,9 @@ func (s *Smart) applySurgeOrdering(ranks []smartRank, selectionKey, preferredTag
 	bestDelay := 0.0
 	for index := range ranks {
 		if !ranks[index].eligible || ranks[index].status.State == "open" {
+			continue
+		}
+		if hasNormal && ranks[index].standbyOnly {
 			continue
 		}
 		eligibleCount++
@@ -1929,6 +2049,50 @@ func (s *Smart) noteCandidateProbe(candidate string, now time.Time) {
 		probeID = candidate
 	}
 	s.noteProbeTimestamp(&s.probeLastAt, probeID, now)
+}
+
+func (s *Smart) noteCandidateAttempt(candidate string, now time.Time) {
+	if s == nil || candidate == "" {
+		return
+	}
+	probeID := s.candidateProbeIdentity(candidate)
+	if probeID == "" {
+		probeID = candidate
+	}
+	s.noteProbeTimestamp(&s.probeAttemptAt, probeID, now)
+}
+
+func (s *Smart) probeCoverageLocked() (attempted, total int) {
+	seen := make(map[string]struct{}, len(s.candidates))
+	for _, candidate := range s.candidates {
+		if candidate == nil {
+			continue
+		}
+		metadata := s.candidateMetadataByTag[candidate.Tag()]
+		probeID := metadata.identity
+		if probeID == "" {
+			probeID = candidate.Tag()
+		}
+		if _, exists := seen[probeID]; exists {
+			continue
+		}
+		seen[probeID] = struct{}{}
+		total++
+		if !s.probeAttemptAt[probeID].IsZero() || !s.udpProbeLastAt[probeID].IsZero() {
+			attempted++
+		}
+	}
+	return
+}
+
+func (s *Smart) probeCoverage() (attempted, total int) {
+	if s == nil {
+		return 0, 0
+	}
+	s.access.RLock()
+	attempted, total = s.probeCoverageLocked()
+	s.access.RUnlock()
+	return
 }
 
 // noteUDPCandidateProbe keeps UDP coverage independent from TCP coverage. A
@@ -2035,7 +2199,7 @@ func (s *Smart) selectProbeCandidates(candidates []adapter.Outbound, budget int,
 		}
 		seenProbeIDs[probeID] = struct{}{}
 		usage := decayedSmartUseScore(s.useScores[profileID], now)
-		items = append(items, probeCandidate{candidate: candidate, probeID: probeID, usage: usage, lastProbe: s.probeLastAt[probeID]})
+		items = append(items, probeCandidate{candidate: candidate, probeID: probeID, usage: usage, lastProbe: s.probeAttemptAt[probeID]})
 	}
 	s.access.RUnlock()
 	if len(items) == 0 {
@@ -2321,10 +2485,17 @@ func (s *Smart) activeAt(now time.Time) bool {
 }
 
 func (s *Smart) nextProbeInterval(now time.Time) time.Duration {
-	if s.activeAt(now) {
-		return s.probeInterval
+	interval := s.probeInterval
+	if interval <= 0 {
+		interval = defaultSmartProbeInterval
 	}
-	return max(s.probeInterval, defaultSmartIdleProbeInterval)
+	if attempted, total := s.probeCoverage(); total > 0 && float64(attempted)/float64(total) < 0.9 {
+		return min(interval, defaultSmartColdCoverageInterval)
+	}
+	if s.activeAt(now) {
+		return interval
+	}
+	return max(interval, defaultSmartIdleProbeInterval)
 }
 
 func (s *Smart) scheduledProbeBudget(now time.Time) int {
@@ -2495,6 +2666,12 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 	}
 	status.Candidates = append([]adapter.SmartCandidateStatus(nil), status.Candidates...)
 	status.StateCounts = cloneSmartStateCounts(status.StateCounts)
+	s.access.RLock()
+	status.ProbeEndpointsAttempted, status.ProbeEndpointsTotal = s.probeCoverageLocked()
+	s.access.RUnlock()
+	if status.ProbeEndpointsTotal > 0 {
+		status.ProbeCoveragePercent = 100 * float64(status.ProbeEndpointsAttempted) / float64(status.ProbeEndpointsTotal)
+	}
 	status.SwitchesTotal = s.switchesTotal.Load()
 	status.PerformanceSwitches = s.performanceSwitches.Load()
 	status.FailureFailovers = s.failureFailovers.Load()
@@ -2804,7 +2981,7 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 	}
 	attempts := make([]smartDialAttempt, 0, min(maxAttempts, len(ranks)))
 	seenDialIdentities := make(map[string]struct{}, len(ranks))
-	for rankIndex := range ranks {
+	for _, rankIndex := range smartAttemptRankOrder(ranks, maxAttempts) {
 		if len(attempts) >= maxAttempts {
 			break
 		}
@@ -2842,6 +3019,52 @@ func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, tran
 		})
 	}
 	return attempts
+}
+
+// smartAttemptRankOrder reserves one final retry slot for an explicit standby
+// after normal members have failed. A standby never wins the first cold dial
+// while a normal member is available, but stays reachable within the bounded
+// per-request retry budget instead of sitting behind a large catalog forever.
+func smartAttemptRankOrder(ranks []smartRank, maxAttempts int) []int {
+	if maxAttempts <= 0 {
+		maxAttempts = defaultSmartMaxAttempts
+	}
+	normals := make([]int, 0, len(ranks))
+	standbys := make([]int, 0)
+	for index, rank := range ranks {
+		if !rank.eligible || rank.status.State == "open" {
+			continue
+		}
+		if rank.standbyOnly {
+			standbys = append(standbys, index)
+		} else {
+			normals = append(normals, index)
+		}
+	}
+	// Once a standby has actually accepted traffic and became the fixed-mode
+	// incumbent, keep it first on later requests until it becomes unavailable.
+	for position, index := range standbys {
+		if ranks[index].incumbent {
+			order := make([]int, 0, len(normals)+len(standbys))
+			order = append(order, index)
+			order = append(order, normals...)
+			order = append(order, standbys[:position]...)
+			order = append(order, standbys[position+1:]...)
+			return order
+		}
+	}
+	if len(normals) == 0 {
+		return standbys
+	}
+	if len(standbys) == 0 || maxAttempts <= 1 {
+		return append(normals, standbys...)
+	}
+	firstNormals := min(len(normals), maxAttempts-1)
+	order := make([]int, 0, len(normals)+len(standbys))
+	order = append(order, normals[:firstNormals]...)
+	order = append(order, standbys...)
+	order = append(order, normals[firstNormals:]...)
+	return order
 }
 
 type smartRecoveryCandidate struct {
@@ -3285,9 +3508,13 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	}
 	var attemptErrors []error
 	attemptCount := 0
-	for rankIndex := range ranks {
+	maxAttempts := s.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultSmartMaxAttempts
+	}
+	for _, rankIndex := range smartAttemptRankOrder(ranks, maxAttempts) {
 		rank := ranks[rankIndex]
-		if !rank.eligible || rank.status.State == "open" || attemptCount >= s.maxAttempts {
+		if !rank.eligible || rank.status.State == "open" || attemptCount >= maxAttempts {
 			continue
 		}
 		reserved := s.reserveHalfOpen(rank, networkKey, siteKey, transport)
@@ -3595,6 +3822,7 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 		published := false
 		observed := make(map[string]struct{}, len(candidates)*2)
 		noted := make(map[string]struct{}, len(candidates))
+		attemptedProfiles := make(map[string]struct{}, len(candidates))
 		performedProfiles := make(map[string]struct{}, len(candidates))
 		successfulProfiles := make(map[string]struct{}, len(candidates))
 		for probe := range results {
@@ -3632,6 +3860,12 @@ func (s *Smart) probeWithBudget(ctx context.Context, budget int) (result map[str
 					s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, true, elapsed)
 				} else if family.err != nil && family.performed {
 					s.observeProbeResult(dashboardProbe, time.Now(), networkKey, "", probe.candidate.Tag(), family.transport, false, family.elapsed)
+				}
+			}
+			if (probe.performed || probe.err == nil || familyPerformed) && !s.closing.Load() {
+				if _, exists := attemptedProfiles[profileID]; !exists {
+					attemptedProfiles[profileID] = struct{}{}
+					s.noteCandidateAttempt(probe.candidate.Tag(), time.Now())
 				}
 			}
 			if probe.err != nil && familySuccess == 0 {
@@ -4403,6 +4637,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			estimate:            estimate,
 			scoreEstimate:       scoreEstimate,
 			activeProbeDegraded: activeProbeDegraded,
+			standbyOnly:         metadata.standbyOnly,
+			incumbent:           candidate.Tag() == lastSelected,
 			siteTainted:         siteTainted,
 			siteSuccesses:       siteSuccesses,
 			siteDelayMS:         siteDelayMS,
@@ -4412,6 +4648,7 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			eligible: estimate.State != "open",
 			status: adapter.SmartCandidateStatus{
 				Tag:             candidate.Tag(),
+				StandbyOnly:     metadata.standbyOnly,
 				EndpointID:      smartEndpointID(metadata.identity, metadata.policyID),
 				State:           estimate.State,
 				Reliability:     estimate.Reliability,
@@ -4528,6 +4765,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 	if temporary != "" {
 		if index := smartRankIndex(ranks, temporary); index >= 0 && ranks[index].status.State != "open" {
 			ranks[index].eligible = true
+			ranks[index].standbyOnly = false
+			ranks[index].status.StandbyOnly = false
 			ranks[index].status.Reason = "temporary manual override"
 			moveSmartRankFirst(ranks, index)
 			s.updateStatus(networkKey, siteDisplay, transport, ranks, "temporary manual override")
@@ -4540,6 +4779,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			// A permanent manual selection is authoritative while its circuit is
 			// usable. RTT and score changes must never silently overrule a human.
 			ranks[index].eligible = true
+			ranks[index].standbyOnly = false
+			ranks[index].status.StandbyOnly = false
 			ranks[index].status.Reason = "manual pin"
 			moveSmartRankFirst(ranks, index)
 			s.updateStatus(networkKey, siteDisplay, transport, ranks, "manual pin")
@@ -5374,6 +5615,13 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	if cap(statuses) < statusCount {
 		statuses = make([]adapter.SmartCandidateStatus, 0, statusCount)
 	}
+	hasNormal := false
+	for _, rank := range ranks {
+		if rank.eligible && rank.status.State != "open" && !rank.standbyOnly {
+			hasNormal = true
+			break
+		}
+	}
 	primaryAssigned := false
 	appendStatus := func(rank smartRank) {
 		if len(statuses) >= statusCount {
@@ -5385,6 +5633,8 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 			status.Role = "primary"
 			primaryAssigned = true
 		case !rank.eligible || rank.status.State == "open":
+			status.Role = "standby"
+		case hasNormal && rank.standbyOnly:
 			status.Role = "standby"
 		case !primaryAssigned:
 			status.Role = "primary"

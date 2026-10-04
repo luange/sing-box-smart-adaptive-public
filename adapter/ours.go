@@ -58,6 +58,7 @@ type SmartCandidateStatus struct {
 	Weight          float64 `json:"weight,omitempty"`
 	WeightRule      string  `json:"weight_rule,omitempty"`
 	WeightExact     bool    `json:"weight_rule_exact,omitempty"`
+	StandbyOnly     bool    `json:"standby_only,omitempty"`
 	Reliability     float64 `json:"reliability"`
 	ConnectMS       float64 `json:"connect_ms,omitempty"`
 	ConnectP95MS    float64 `json:"connect_p95_ms,omitempty"`
@@ -120,6 +121,9 @@ type SmartGroupStatus struct {
 	Reason                    string                   `json:"reason,omitempty"`
 	UpdatedAt                 time.Time                `json:"updated_at,omitempty"`
 	CandidateCount            int                      `json:"candidate_count"`
+	ProbeEndpointsTotal       int                      `json:"probe_endpoints_total"`
+	ProbeEndpointsAttempted   int                      `json:"probe_endpoints_attempted"`
+	ProbeCoveragePercent      float64                  `json:"probe_coverage_percent"`
 	CandidateDetailsCount     int                      `json:"candidate_details_count"`
 	CandidateDetailsTruncated bool                     `json:"candidate_details_truncated"`
 	StateCounts               map[string]int           `json:"state_counts"`
@@ -143,15 +147,20 @@ type SmartGroupStatus struct {
 }
 
 type SmartProbeTargetStatus struct {
-	TargetHost        string `json:"target_host"`
-	Attempts          uint64 `json:"attempts"`
-	Successes         uint64 `json:"successes"`
-	Failures          uint64 `json:"failures"`
-	Timeouts          uint64 `json:"timeouts"`
-	HTTPFailures      uint64 `json:"http_failures"`
-	TLSFailures       uint64 `json:"tls_failures"`
-	TransportFailures uint64 `json:"transport_failures"`
-	LastFailureClass  string `json:"last_failure_class,omitempty"`
+	TargetHost             string `json:"target_host"`
+	Attempts               uint64 `json:"attempts"`
+	Successes              uint64 `json:"successes"`
+	Failures               uint64 `json:"failures"`
+	Timeouts               uint64 `json:"timeouts"`
+	HTTPFailures           uint64 `json:"http_failures"`
+	TargetHTTPFailures     uint64 `json:"target_http_failures"`
+	ProxyHandshakeFailures uint64 `json:"proxy_handshake_failures"`
+	DNSFailures            uint64 `json:"dns_failures"`
+	TLSFailures            uint64 `json:"tls_failures"`
+	TransportFailures      uint64 `json:"transport_failures"`
+	LastFailureClass       string `json:"last_failure_class,omitempty"`
+	LastFailureStage       string `json:"last_failure_stage,omitempty"`
+	LastHTTPStatus         int    `json:"last_http_status,omitempty"`
 }
 
 type SmartSwitchAudit struct {
