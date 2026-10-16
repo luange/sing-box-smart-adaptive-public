@@ -74,12 +74,13 @@ type SmartCandidateStatus struct {
 // selection context. It prevents an unrelated TCP or UDP context from hiding
 // the evidence used for the current decision in dashboards.
 type SmartContextStatus struct {
-	Network                   string                 `json:"network,omitempty"`
-	Site                      string                 `json:"site,omitempty"`
-	Transport                 string                 `json:"transport,omitempty"`
-	Phase                     string                 `json:"phase,omitempty"`
-	Selected                  string                 `json:"selected,omitempty"`
-	SelectedEndpointID        string                 `json:"selected_endpoint_id,omitempty"`
+	Network            string `json:"network,omitempty"`
+	Site               string `json:"site,omitempty"`
+	Transport          string `json:"transport,omitempty"`
+	Phase              string `json:"phase,omitempty"`
+	Selected           string `json:"selected,omitempty"`
+	SelectedEndpointID string `json:"selected_endpoint_id,omitempty"`
+	// Deprecated: retained as a wire-compatible alias for older dashboards.
 	ZigSelectedEndpointID     string                 `json:"zig_selected_endpoint_id,omitempty"`
 	ActualDialEndpointID      string                 `json:"actual_dial_endpoint_id,omitempty"`
 	SelectionGeneration       uint64                 `json:"selection_generation,omitempty"`
@@ -118,14 +119,14 @@ type SmartDialDiagnostic struct {
 // SmartGroupStatus is exported for clash/API status surfaces.
 type SmartGroupStatus struct {
 	Mode uint8 `json:"mode"`
-	// PolicyBackend identifies the compiled selection kernel. Production
-	// releases must report "zig"; "unavailable" is a fail-closed build and
-	// "go-reference" is reserved for explicit development builds.
-	PolicyBackend             string                   `json:"policy_backend,omitempty"`
-	PolicyBackendRequired     bool                     `json:"policy_backend_required"`
-	PolicyBackendAvailable    bool                     `json:"policy_backend_available"`
-	Selected                  string                   `json:"selected,omitempty"`
-	SelectedEndpointID        string                   `json:"selected_endpoint_id,omitempty"`
+	// PolicyBackend identifies the Smart policy owner. Production Smart is
+	// implemented by the in-process Go state machine.
+	PolicyBackend          string `json:"policy_backend,omitempty"`
+	PolicyBackendRequired  bool   `json:"policy_backend_required"`
+	PolicyBackendAvailable bool   `json:"policy_backend_available"`
+	Selected               string `json:"selected,omitempty"`
+	SelectedEndpointID     string `json:"selected_endpoint_id,omitempty"`
+	// Deprecated: retained as a wire-compatible alias for older dashboards.
 	ZigSelectedEndpointID     string                   `json:"zig_selected_endpoint_id,omitempty"`
 	ActualDialEndpointID      string                   `json:"actual_dial_endpoint_id,omitempty"`
 	SelectionGeneration       uint64                   `json:"selection_generation,omitempty"`

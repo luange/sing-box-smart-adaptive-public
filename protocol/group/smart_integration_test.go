@@ -291,9 +291,9 @@ func newTestSmart(candidates ...adapter.Outbound) *Smart {
 		families:             trafficfamily.NewResolver(),
 	}
 	// Keep integration tests on the same policy owner as production builds when
-	// the smart_zig CI tag is present. Untagged tests intentionally exercise the
+	// the adaptive_zig CI tag is present. Untagged tests intentionally exercise the
 	// host-only path without constructing a production Smart outbound; packaged
-	// builds use smart_zig,production_smart.
+	// release builds use adaptive_zig,production_smart.
 	smart.policyBackend = newSmartPolicyBackend(smartPolicyBackendConfig{
 		Exploration:         smart.exploration,
 		SwitchMargin:        smart.switchMargin,
@@ -1508,7 +1508,7 @@ func TestSmartUnprovenSubscriptionAliasRequiresSwitchConfirmation(t *testing.T) 
 	}
 	wantReason := "fixed primary retained"
 	if smartPolicyBackendRequired() {
-		wantReason = "zig policy retained candidate"
+		wantReason = "policy retained candidate"
 	}
 	if ranks[0].status.Reason != wantReason {
 		t.Fatalf("unproven alias bypassed normal confirmation: %q", ranks[0].status.Reason)
@@ -1601,9 +1601,9 @@ func TestSmartSelectionGenerationAndDialEvidence(t *testing.T) {
 	if got := smart.selectionGeneration[statusKey]; got != 1 {
 		t.Fatalf("initial selection generation=%d, want 1", got)
 	}
-	smart.recordZigSelectedEndpoint(statusKey, ranks[0].status.EndpointID)
+	smart.recordPolicySelectedEndpoint(statusKey, ranks[0].status.EndpointID)
 	smart.recordActualDial(statusKey, ranks[0].status.EndpointID, 1)
-	smart.recordZigSelectedEndpoint(statusKey, ranks[1].status.EndpointID)
+	smart.recordPolicySelectedEndpoint(statusKey, ranks[1].status.EndpointID)
 	smart.markSelected(second, networkKey, siteKey, siteDisplay, N.NetworkTCP, ranks, 1, true)
 	if got := smart.selectionGeneration[statusKey]; got != 2 {
 		t.Fatalf("failover selection generation=%d, want 2", got)
@@ -1652,7 +1652,7 @@ func TestSmartSuccessfulFallbackCommitsDialEvidenceBeforeRecording(t *testing.T)
 	if got := smart.selectionMismatchTotal.Load(); got != 0 {
 		t.Fatalf("successful fallback produced selection mismatch=%d", got)
 	}
-	if got := smart.zigSelectedEndpoint[statusKey]; got != secondID {
+	if got := smart.selectedEndpoint[statusKey]; got != secondID {
 		t.Fatalf("zig endpoint=%q, want %q", got, secondID)
 	}
 }
@@ -2553,8 +2553,8 @@ func TestSmartStatusExposesPolicyBackendContract(t *testing.T) {
 	if status.PolicyBackendRequired != smartPolicyBackendRequired() {
 		t.Fatalf("status backend required=%t, want %t", status.PolicyBackendRequired, smartPolicyBackendRequired())
 	}
-	if status.PolicyBackendAvailable != (smart.policyBackend != nil) {
-		t.Fatalf("status backend available=%t, actual=%t", status.PolicyBackendAvailable, smart.policyBackend != nil)
+	if !status.PolicyBackendAvailable {
+		t.Fatal("Go Smart policy should always be available")
 	}
 }
 

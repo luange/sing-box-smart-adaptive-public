@@ -125,7 +125,7 @@ jobs:
         run: go test ./protocol/group -run 'TestSmart(ObservedConnClassifiesProtocolHandshakeFailures|StatusExposesPolicyBackendContract)$'
 
   smart-zig:
-    name: Smart Zig conformance
+    name: Adaptive/eBPF Zig library tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -134,7 +134,7 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
-      - name: Smart engine tests and Linux libraries
+      - name: Adaptive policy library tests and Linux builds
         working-directory: smart-engine
         run: |
           zig build test -Dcpu=baseline

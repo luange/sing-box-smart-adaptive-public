@@ -1,4 +1,4 @@
-//go:build smart_zig && cgo
+//go:build (adaptive_zig || smart_zig) && cgo
 
 package adaptive
 

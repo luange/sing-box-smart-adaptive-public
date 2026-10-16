@@ -21,14 +21,13 @@ build:
 	export GOTOOLCHAIN=local && \
 	go build $(MAIN_PARAMS) $(MAIN)
 
-# Production Smart build. Build the Zig library on the same Linux target first;
-# production_smart makes a missing Zig ABI fail closed instead of using the
-# reference Go policy.
-SMART_TAGS ?= $(TAGS),smart_zig,production_smart
+# Production Smart build. Smart policy is native Go. The default feature tags
+# may include adaptive_zig for the separate eBPF policy kernel. smart_zig is
+# accepted as a legacy alias by that adapter only.
+SMART_TAGS ?= $(TAGS),production_smart
 
 build_smart:
 	@test "$(GOHOSTOS)" = "linux" || { echo "build_smart must run on Linux" >&2; exit 1; }
-	@test -s smart-engine/zig-out/lib/libsmart_engine.a || { echo "missing smart-engine/zig-out/lib/libsmart_engine.a; run zig build first" >&2; exit 1; }
 	export GOTOOLCHAIN=local CGO_ENABLED=1 && \
 	go build $(PARAMS) -tags "$(SMART_TAGS)" $(MAIN)
 

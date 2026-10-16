@@ -2,10 +2,9 @@ package conformance
 
 import "math"
 
-// This file is the Go reference mirror of smart-engine/src/scoring.zig and
-// the cold-start ranking/confirmation flow of policy.zig (interactive
-// profile). Any change to the Zig kernel formula MUST be mirrored here; the
-// conformance tests pin the two implementations to identical scores.
+// This small independent Go reference keeps expected Smart scoring values
+// separate from the production helper under test. It is not a runtime policy
+// implementation and has no C/Zig dependency.
 
 type Candidate struct {
 	ID, State, Eligible                                                                           uint64
@@ -67,7 +66,7 @@ func weightOf(weight float64) float64 {
 	return weight
 }
 
-// Traffic profiles mirror scoring.zig TrafficProfile.
+// Traffic profile identifiers used by the Smart score reference.
 const (
 	ProfileInteractive = 0
 	ProfileBulk        = 1

@@ -421,9 +421,8 @@ func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdenti
 		metadata.profileID = "dial:" + dialIdentity
 	}
 	// Every candidate must have a stable policy identity. Provider-backed aliases
-	// with the same credential share one Zig state; distinct credentials remain
-	// separate even when they use the same network path. Static/test candidates
-	// use their stable tag and must not be silently omitted from Zig-only builds.
+	// with the same credential share one logical endpoint identity; distinct
+	// credentials remain separate even when they use the same network path.
 	policyIdentity := metadata.dialIdentity
 	if identity == "" {
 		// A generated display suffix is not proof of endpoint equivalence.
@@ -604,7 +603,7 @@ type Smart struct {
 	// transport). It changes only when the canonical EndpointID changes, so
 	// provider aliases do not look like a data-plane switch.
 	selectionGeneration map[string]uint64
-	zigSelectedEndpoint map[string]string
+	selectedEndpoint    map[string]string
 	actualDialEndpoint  map[string]string
 	circuitState        map[string]string
 	latest              common.TypedValue[adapter.Outbound]
@@ -900,13 +899,13 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		SelectionMode:        uint8(selectionMode),
 	})
 	if policyBackend == nil && smartPolicyBackendRequired() {
-		return nil, E.New("opt-in Smart Zig policy backend unavailable")
+		return nil, E.New("required Smart policy backend unavailable")
 	}
 	if logger != nil {
 		if policyBackend == nil {
 			logger.Info("smart policy owner: native Go state machine")
 		} else {
-			logger.Info("smart policy backend: opt-in Zig experiment, selection mode: ", uint8(selectionMode))
+			logger.Info("smart policy backend: ", smartPolicyBackendName(), " selection mode: ", uint8(selectionMode))
 		}
 	}
 	outboundManager := service.FromContext[adapter.OutboundManager](ctx)
@@ -952,7 +951,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		udpProbeLastAt:         make(map[string]time.Time),
 		halfOpen:               make(map[string]struct{}),
 		selectionGeneration:    make(map[string]uint64),
-		zigSelectedEndpoint:    make(map[string]string),
+		selectedEndpoint:       make(map[string]string),
 		actualDialEndpoint:     make(map[string]string),
 		circuitState:           make(map[string]string),
 		store:                  store,
@@ -1486,7 +1485,7 @@ func (s *Smart) Close() error {
 	clear(s.halfOpen)
 	s.halfOpenActive = 0
 	clear(s.selectionGeneration)
-	clear(s.zigSelectedEndpoint)
+	clear(s.selectedEndpoint)
 	clear(s.actualDialEndpoint)
 	clear(s.circuitState)
 	s.candidates = nil
@@ -1504,7 +1503,7 @@ func (s *Smart) Close() error {
 	s.halfOpen = make(map[string]struct{})
 	s.halfOpenActive = 0
 	s.selectionGeneration = make(map[string]uint64)
-	s.zigSelectedEndpoint = make(map[string]string)
+	s.selectedEndpoint = make(map[string]string)
 	s.actualDialEndpoint = make(map[string]string)
 	s.circuitState = make(map[string]string)
 	s.access.Unlock()
@@ -1527,8 +1526,7 @@ func (s *Smart) Close() error {
 
 // policyBackendEnabled snapshots only whether the optional policy kernel is
 // available. Calls into the backend itself must use the helpers below so
-// Smart.Close cannot destroy a Zig engine while another goroutine is inside
-// its C ABI.
+// lifecycle changes cannot race an optional policy implementation.
 func (s *Smart) policyBackendEnabled() bool {
 	s.policyBackendAccess.RLock()
 	enabled := s.policyBackend != nil
@@ -1608,15 +1606,15 @@ func (s *Smart) adoptPolicyBackendSelected(key string, id uint64, now time.Time)
 	s.policyBackendAccess.RUnlock()
 }
 
-func (s *Smart) recordZigSelectedEndpoint(statusKey string, endpointID string) uint64 {
+func (s *Smart) recordPolicySelectedEndpoint(statusKey string, endpointID string) uint64 {
 	if s == nil || statusKey == "" || endpointID == "" {
 		return 0
 	}
 	s.access.Lock()
-	if s.zigSelectedEndpoint == nil {
-		s.zigSelectedEndpoint = make(map[string]string)
+	if s.selectedEndpoint == nil {
+		s.selectedEndpoint = make(map[string]string)
 	}
-	if previous := s.zigSelectedEndpoint[statusKey]; previous != endpointID {
+	if previous := s.selectedEndpoint[statusKey]; previous != endpointID {
 		if s.selectionGeneration == nil {
 			s.selectionGeneration = make(map[string]uint64)
 		}
@@ -1628,7 +1626,7 @@ func (s *Smart) recordZigSelectedEndpoint(statusKey string, endpointID string) u
 		}
 		s.selectionGeneration[statusKey] = generation
 	}
-	s.zigSelectedEndpoint[statusKey] = endpointID
+	s.selectedEndpoint[statusKey] = endpointID
 	generation := s.selectionGeneration[statusKey]
 	s.access.Unlock()
 	return generation
@@ -1636,7 +1634,7 @@ func (s *Smart) recordZigSelectedEndpoint(statusKey string, endpointID string) u
 
 // recordActualDial is the data-plane half of the Smart proof. It records the
 // canonical endpoint that actually accepted a new connection and compares it
-// with the last endpoint returned by Zig. A mismatch is observable (and
+// with the last endpoint returned by the Go Smart policy. A mismatch is observable (and
 // counted) instead of being silently hidden by a provider alias or an
 // in-flight selection race.
 func (s *Smart) recordActualDial(statusKey, endpointID string, dialGeneration uint64) {
@@ -1665,14 +1663,14 @@ func (s *Smart) recordActualDialWithChecks(statusKey, endpointID string, dialGen
 		s.selectionGeneration = make(map[string]uint64)
 	}
 	currentGeneration := s.selectionGeneration[statusKey]
-	zigEndpoint := s.zigSelectedEndpoint[statusKey]
+	selectedEndpoint := s.selectedEndpoint[statusKey]
 	s.actualDialEndpoint[statusKey] = endpointID
 	s.access.Unlock()
-	if (checkEndpoint && zigEndpoint != "" && zigEndpoint != endpointID) ||
+	if (checkEndpoint && selectedEndpoint != "" && selectedEndpoint != endpointID) ||
 		(checkGeneration && dialGeneration != 0 && currentGeneration != 0 && dialGeneration != currentGeneration) {
 		s.selectionMismatchTotal.Add(1)
 		if s.logger != nil {
-			s.logger.Warn("smart control/data selection mismatch: zig_selected_endpoint=", zigEndpoint,
+			s.logger.Warn("smart control/data selection mismatch: selected_endpoint=", selectedEndpoint,
 				" actual_dial_endpoint=", endpointID, " selection_generation=", currentGeneration,
 				" dial_generation=", dialGeneration)
 		}
@@ -1906,7 +1904,7 @@ func (s *Smart) stableAffinityIndex(ranks []smartRank, key, preferredTag string)
 
 // applySurgeOrdering implements Surge's per-request A/B/C candidate ordering.
 // The returned slice is the dial failover order and the same 1-based order is
-// passed to Zig, so control-plane selection and the actual data plane cannot
+// passed to the Go policy, so control-plane selection and the actual data plane cannot
 // disagree. Hard-open candidates remain ineligible and sort last.
 func (s *Smart) applySurgeOrdering(ranks []smartRank, selectionKey, preferredTag string, now time.Time) {
 	if len(ranks) == 0 {
@@ -2821,7 +2819,7 @@ func (s *Smart) smartStatusSnapshot() (adapter.SmartGroupStatus, string, uint64)
 	}
 	s.access.RLock()
 	if statusLastContext != "" {
-		status.ZigSelectedEndpointID = s.zigSelectedEndpoint[statusLastContext]
+		status.ZigSelectedEndpointID = s.selectedEndpoint[statusLastContext]
 		status.ActualDialEndpointID = s.actualDialEndpoint[statusLastContext]
 		status.SelectionGeneration = s.selectionGeneration[statusLastContext]
 		status.CircuitState = s.circuitState[statusLastContext]
@@ -2830,13 +2828,16 @@ func (s *Smart) smartStatusSnapshot() (adapter.SmartGroupStatus, string, uint64)
 	status.PolicyBackend = smartPolicyBackendName()
 	status.Mode = uint8(s.selectionMode)
 	status.PolicyBackendRequired = smartPolicyBackendRequired()
-	status.PolicyBackendAvailable = s.policyBackendEnabled()
+	// The Go Smart state machine is always the active policy owner. The optional
+	// backend field is retained internally only for compatibility with existing
+	// status/selection plumbing; Smart policy is implemented entirely in Go.
+	status.PolicyBackendAvailable = true
 	if len(statusContexts) > 0 {
 		status.Contexts = make([]adapter.SmartContextStatus, 0, len(statusContexts))
 		for _, key := range statusContextOrder {
 			if contextStatus, loaded := statusContexts[key]; loaded {
 				s.access.RLock()
-				contextStatus.ZigSelectedEndpointID = s.zigSelectedEndpoint[key]
+				contextStatus.ZigSelectedEndpointID = s.selectedEndpoint[key]
 				contextStatus.ActualDialEndpointID = s.actualDialEndpoint[key]
 				contextStatus.SelectionGeneration = s.selectionGeneration[key]
 				contextStatus.CircuitState = s.circuitState[key]
@@ -3106,7 +3107,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
 	if ranking.policyUnavailable {
-		return nil, E.New("smart Zig policy backend unavailable")
+		return nil, E.New("Smart policy backend unavailable")
 	}
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
@@ -3739,7 +3740,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	defer func() { ranking.Release() }()
 	ranks := ranking.ranks
 	if ranking.policyUnavailable {
-		return nil, E.New("smart Zig policy backend unavailable")
+		return nil, E.New("Smart policy backend unavailable")
 	}
 	if len(ranks) == 0 {
 		return nil, E.New("smart group is warming: no supported candidate")
@@ -4649,7 +4650,7 @@ func (s *Smart) observeDial(now time.Time, network, site, candidate, transport s
 
 // observeProbeResult keeps every active measurement advisory. Scheduled and
 // dashboard URL tests contribute latency/success counters, but cannot alter
-// breaker state or feed the Zig policy owner. In particular, neither a panel
+// breaker state or feed a separate policy owner. In particular, neither a panel
 // ping nor a shared probe-target incident may evict a serving primary.
 func (s *Smart) observeProbeResult(_ bool, now time.Time, network, site, candidate, transport string, success bool, elapsed time.Duration) {
 	// Active URL tests are baseline/ranking evidence, never breaker evidence.
@@ -4673,7 +4674,7 @@ func (s *Smart) observeDataPlaneFailure(now time.Time, network, site, candidate,
 func (s *Smart) observeDataPlaneFailureWithType(now time.Time, network, site, candidate, transport string, elapsed time.Duration, failureType string) {
 	profileID := s.candidateProfileID(candidate)
 	// Site-local failures belong to the Go evidence ledger first. Feeding every
-	// timeout directly into the Zig context made one website failure look like
+	// timeout directly into a shared context made one website failure look like
 	// a group-wide endpoint failure and replaced the primary immediately.
 	s.store.observeDial(now, network, site, profileID, transport, false, elapsed)
 	nodeFailure := failureType == "protocol" || failureType == "hard_transport"
@@ -5010,10 +5011,10 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		for index := range ranks {
 			ranks[index].eligible = false
 			ranks[index].status.State = "open"
-			ranks[index].status.Reason = "zig policy unavailable"
+			ranks[index].status.Reason = "policy backend unavailable"
 		}
 		ranking.policyUnavailable = true
-		s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+		s.updateStatus(networkKey, siteDisplay, transport, ranks, "policy backend unavailable")
 		return ranking, networkKey, siteKey, siteDisplay
 	}
 	if ranks[0].status.State == "open" {
@@ -5094,8 +5095,8 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			policyIncumbent = affinity.Candidate
 		}
 		// A policy context can be evicted and recreated to keep memory bounded.
-		// Seed only an empty Zig context from this subservice's confirmed
-		// incumbent or its parent business affinity. Zig still owns an independent
+		// Seed only an empty policy context from this subservice's confirmed
+		// incumbent or its parent business affinity. The policy owns an independent
 		// context afterwards, so failures and confirmation state never cross from
 		// one subservice into another.
 		if currentIndex := smartRankIndex(ranks, policyIncumbent); currentIndex >= 0 {
@@ -5107,16 +5108,16 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 		decision, backendAvailable := s.choosePolicyBackend(selectionKey, policyCandidates, profile, now)
 		if !backendAvailable {
 			// Close can retire the backend while a ranking snapshot is still being
-			// assembled. In a Zig-only release this is a closed state, never an
+			// assembled. In an external-backend-only build this is a closed state, never an
 			// invitation to re-enter the duplicate Go policy state machine.
 			if smartPolicyBackendRequired() {
 				for index := range ranks {
 					ranks[index].eligible = false
 					ranks[index].status.State = "open"
-					ranks[index].status.Reason = "zig policy unavailable"
+					ranks[index].status.Reason = "policy backend unavailable"
 				}
 				ranking.policyUnavailable = true
-				s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, "policy backend unavailable")
 				return ranking, networkKey, siteKey, siteDisplay
 			}
 			usePolicyBackend = false
@@ -5151,9 +5152,9 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 						// not a confirmed failover. Keep a healthy incumbent until the
 						// backend's confirmation FSM reports Switched, while still
 						// allowing hard-open candidates to fail over immediately.
-						ranks[currentIndex].status.Reason = "zig policy awaiting sustained confirmation"
+						ranks[currentIndex].status.Reason = "policy awaiting sustained confirmation"
 						moveSmartRankFirst(ranks, currentIndex)
-						s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy awaiting sustained confirmation")
+						s.updateStatus(networkKey, siteDisplay, transport, ranks, "policy awaiting sustained confirmation")
 						return ranking, networkKey, siteKey, siteDisplay
 					}
 					if currentIndex >= 0 && !smartPolicyBackendRequired() && currentIndex != selectedIndex &&
@@ -5173,15 +5174,15 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 					if ranking.policySelectedEndpointID == "" {
 						ranking.policySelectedEndpointID = smartEndpointID(ranks[selectedIndex].identity, ranks[selectedIndex].policyID)
 					}
-					generation := s.recordZigSelectedEndpoint(ranking.statusKey, ranking.policySelectedEndpointID)
+					generation := s.recordPolicySelectedEndpoint(ranking.statusKey, ranking.policySelectedEndpointID)
 					if generation != 0 {
 						for index := range ranks {
 							ranks[index].selectionGeneration = generation
 						}
 					}
-					reason := "zig policy retained candidate"
+					reason := "policy retained candidate"
 					if decision.Switched {
-						reason = "zig policy confirmed candidate"
+						reason = "policy confirmed candidate"
 					} else if equivalentRetained {
 						reason = "equivalent subscription line retained"
 					}
@@ -5193,19 +5194,19 @@ func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.
 			}
 			// A corrupt/unsupported backend decision must fail safe to the best
 			// host-ranked candidate, without re-entering the Go confirmation FSM.
-			// Zig-only release builds instead fail closed: accepting a Go decision
+			// External-backend-only builds instead fail closed: accepting a host decision
 			// here would reintroduce a second policy owner after an ABI/runtime
 			// failure and make production behavior non-deterministic.
 			if smartPolicyBackendRequired() {
 				for index := range ranks {
 					ranks[index].eligible = false
 					ranks[index].status.State = "open"
-					ranks[index].status.Reason = "zig policy unavailable"
+					ranks[index].status.Reason = "policy backend unavailable"
 				}
-				s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy unavailable")
+				s.updateStatus(networkKey, siteDisplay, transport, ranks, "policy backend unavailable")
 				return ranking, networkKey, siteKey, siteDisplay
 			}
-			s.updateStatus(networkKey, siteDisplay, transport, ranks, "zig policy fallback to host ranking")
+			s.updateStatus(networkKey, siteDisplay, transport, ranks, "policy fallback to host ranking")
 			return ranking, networkKey, siteKey, siteDisplay
 		}
 	}
@@ -5282,9 +5283,9 @@ func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey,
 	key := smartBusinessSelectionKey(networkKey, siteKey, transport)
 	statusKey := smartStatusSelectionKey(networkKey, siteDisplay, transport)
 	usePolicyBackend := s.policyBackendEnabled()
-	// A concurrent Close may retire the Zig engine after rankPooled returned a
+	// A concurrent Close may retire an optional policy backend after rankPooled returned a
 	// candidate but before its dial completed. Do not let this late completion
-	// update host-owned Go switch/cooldown state in a Zig-only release; the
+	// update host-owned Go switch/cooldown state in a backend-required release; the
 	// ranking is already invalid and the next request will fail closed.
 	if smartPolicyBackendRequired() && !usePolicyBackend {
 		return false
@@ -5347,16 +5348,16 @@ func (s *Smart) markSelectedWithSnapshot(candidate adapter.Outbound, networkKey,
 		s.lastSelectedAt = make(map[string]time.Time)
 	}
 	s.lastSelectedAt[key] = now
-	if logicalSwitch && s.zigSelectedEndpoint[statusKey] != currentEndpointID {
+	if logicalSwitch && s.selectedEndpoint[statusKey] != currentEndpointID {
 		currentGeneration++
 	}
-	if s.zigSelectedEndpoint == nil {
-		s.zigSelectedEndpoint = make(map[string]string)
+	if s.selectedEndpoint == nil {
+		s.selectedEndpoint = make(map[string]string)
 	}
 	// A failure-driven retry is a new authoritative selection. Keep the Zig
 	// proof state aligned before recording the successful data-plane dial; the
 	// old ordering reported every legitimate fallback as a mismatch.
-	s.zigSelectedEndpoint[statusKey] = currentEndpointID
+	s.selectedEndpoint[statusKey] = currentEndpointID
 	s.selectionGeneration[statusKey] = currentGeneration
 	delete(s.switchChallenges, key)
 	if !usePolicyBackend && logicalSwitch && !failureSwitch {
@@ -5652,7 +5653,7 @@ func smartSelectionKey(networkKey, siteKey, transport string) string {
 }
 
 // A site key may carry a parent business identity after the unit separator.
-// Metrics and Zig contexts keep the complete key, so subservice failures and
+// Metrics and Smart contexts keep the complete key, so subservice failures and
 // confirmation state remain isolated. Only the bounded affinity seed uses the
 // parent suffix, allowing a new related subservice to inherit a stable primary.
 func smartSelectionSiteKey(siteKey string) string {
@@ -5849,7 +5850,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	if circuitState != "" {
 		s.circuitState[contextKey] = circuitState
 	}
-	zigSelectedEndpointID := s.zigSelectedEndpoint[contextKey]
+	policySelectedEndpointID := s.selectedEndpoint[contextKey]
 	actualDialEndpointID := s.actualDialEndpoint[contextKey]
 	selectionGeneration := s.selectionGeneration[contextKey]
 	s.access.Unlock()
@@ -5930,7 +5931,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	s.status = adapter.SmartGroupStatus{
 		Selected:                  selected,
 		SelectedEndpointID:        selectedEndpointID,
-		ZigSelectedEndpointID:     zigSelectedEndpointID,
+		ZigSelectedEndpointID:     policySelectedEndpointID,
 		ActualDialEndpointID:      actualDialEndpointID,
 		SelectionGeneration:       selectionGeneration,
 		LastFailureType:           lastFailureType,
@@ -5968,7 +5969,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		Phase:                     s.currentPhase().String(),
 		Selected:                  selected,
 		SelectedEndpointID:        selectedEndpointID,
-		ZigSelectedEndpointID:     zigSelectedEndpointID,
+		ZigSelectedEndpointID:     policySelectedEndpointID,
 		ActualDialEndpointID:      actualDialEndpointID,
 		SelectionGeneration:       selectionGeneration,
 		LastFailureType:           lastFailureType,
@@ -6082,15 +6083,15 @@ func (s *Smart) pruneContextStateLocked(now time.Time) {
 			delete(s.switchChallenges, key)
 		}
 	}
-	// zigSelectedEndpoint and selectionGeneration share one key set; cap both
+	// selectedEndpoint and selectionGeneration share one key set; cap both
 	// together by dropping arbitrary rows past the limit (same policy as the
 	// affinity overflow pass).
-	if len(s.zigSelectedEndpoint) >= limit {
-		for key := range s.zigSelectedEndpoint {
-			if len(s.zigSelectedEndpoint) < limit && len(s.selectionGeneration) < limit {
+	if len(s.selectedEndpoint) >= limit {
+		for key := range s.selectedEndpoint {
+			if len(s.selectedEndpoint) < limit && len(s.selectionGeneration) < limit {
 				break
 			}
-			delete(s.zigSelectedEndpoint, key)
+			delete(s.selectedEndpoint, key)
 			delete(s.selectionGeneration, key)
 		}
 	}

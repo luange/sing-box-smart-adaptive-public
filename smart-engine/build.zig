@@ -34,6 +34,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run Smart policy core tests");
+    const test_step = b.step("test", "Run adaptive/eBPF policy tests");
     test_step.dependOn(&run_tests.step);
 }

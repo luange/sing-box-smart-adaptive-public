@@ -52,9 +52,13 @@
 - Report the active selection mode in Smart status so operators can verify the
   configured policy at runtime.
 
-## Unreleased — Zig Smart production backend
+## Historical — retired Zig Smart production backend
 
-### Explicit numeric Smart modes in Zig ABI
+The Smart-group selector was subsequently consolidated into the Go runtime.
+Zig remains only in the separate adaptive/eBPF policy kernel. New builds use
+`adaptive_zig`; `smart_zig` is retained as a deprecated build-tag alias.
+
+### Explicit numeric Smart modes (historical Zig implementation)
 
 - Keep numeric `mode` values 0/1 in the versioned Zig policy ABI, defaulting to 1.
 - Keep health tiers, score margin, incumbent retention, confirmation and

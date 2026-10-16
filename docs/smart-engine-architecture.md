@@ -4,65 +4,23 @@
 
 Production Smart has one policy owner: the Go `Smart` runtime in
 `protocol/group/smart.go`. It owns candidate health, selection, incumbent,
-confirmation/cooldown, pin state, and real dial-result transitions. The Zig
-library in `smart-engine/` remains an opt-in experiment; production releases
-do not enable its Smart adapter. The separate adaptive/eBPF policy kernel may
-still use the `smart_zig` build tag.
+confirmation/cooldown, pin state, probe scheduling and real dial-result
+transitions. Smart does not call a Zig ABI, link a Zig Smart library, or select
+between Go and Zig policy implementations at build time.
 
-The boundary is a versioned C ABI. Hosts provide a bounded candidate snapshot
-(`id`, health evidence, latency, jitter, throughput, weight and eligibility)
-and report observations. The kernel returns a decision plus a reason. This
-keeps provider refreshes and core-specific object lifetimes outside the policy
-code, so a future mihomo adapter can reuse the same binary and tests.
+The Smart decision path stays in-process with sing-box so endpoint identity,
+provider refresh, protocol-aware failure classification, actual dialing and
+connection interruption share one lifecycle. Real dial outcomes are serialized
+through a single transaction boundary: record diagnostics, update health and
+breaker state, then commit the selected endpoint. The Go implementation is the
+only runtime implementation; tests target that same implementation.
 
-The ABI has an additive profile entry point for interactive, bulk and UDP
-traffic. The original `smart_engine_choose` remains interactive for older
-hosts; unknown profile values fall back to interactive scoring.
-
-## Modules
-
-- `model.zig`: ABI-safe data types and state constants.
-- `metrics.zig`: fixed-capacity, allocation-free observation table. Entries are
-  evicted by oldest update when the limit is reached; an open-addressing index
-  makes normal lookup expected O(1), and reset releases no hidden map capacity.
-- `scoring.zig`: pure reliability/tail-latency/jitter/weight scoring functions.
-- `policy.zig`: incumbent retention, margin, confirmation and cooldown state
-  transitions. It has no I/O and is deterministic for `(snapshot, now)`.
-- `lib.zig`: thin lifecycle and C ABI facade.
-
-The Go implementation is the production path. The experimental Zig Smart
-adapter is selected only by the explicit `smart_policy_zig` tag, and its
-conformance suite runs separately. A release may carry `smart_zig` for the
-adaptive/eBPF subsystem while Smart remains entirely Go-owned.
-
-Zig deliberately does not open sockets or duplicate sing-box protocol code.
-The Go host remains the network-I/O adapter that performs the actual TCP/UDP
-probe. Production Smart serializes real dial result handling: record a bounded
-diagnostic, apply the health/breaker update, then commit the selected endpoint.
-This prevents a release from maintaining two incumbent/confirmation states.
-
-The Go adapter sends candidates through the existing batch ABI entry point and
-reuses one conversion buffer per lock shard (16 shards, four bounded contexts
-each). Different service contexts can rank concurrently without retaining a
-large candidate buffer per context.
-
-### Parameter ownership and parity
-
-The Zig ABI receives every parameter that changes a selection decision:
-`exploration`, `switch_margin`, `switch_confirm_samples`, `switch_confirm`,
-`switch_cooldown`, `switch_min_improvement`, `site_stickiness`, and
-numeric `mode`, and the configured `min_samples` confidence floor. Candidate `weight`, health state, reliability, p95 connect /
-first-byte latency, jitter, throughput, sample count, and eligibility are sent
-in each bounded snapshot. ABI version 5 is required when this layout changes.
-
-The remaining Smart options are intentionally host-owned and are not missing
-ABI fields: URL/probe interval, probe concurrency and timeout, dial attempts,
-stall observation, breaker and half-life storage, passive throughput gating,
-provider/catalog filters, manual pins, connection interruption, and history/API
-limits. They perform I/O, lifecycle, or evidence preparation before the Zig
-kernel is called. Keeping them out of Zig avoids a second scheduler or a second
-health store. The host and Zig scoring paths use the same p95 latency order,
-half-open penalty, confidence prior, and exploration formula.
+The separate adaptive/eBPF policy kernel remains Zig-backed behind the
+`adaptive_zig` build tag (`smart_zig` remains a compatibility alias). It handles
+AdaptivePool/eBPF candidate ordering only and is not involved in Smart-group
+choices. This is intentionally retained because
+it is a distinct subsystem with a separate C ABI and does not duplicate Smart's
+health, pin or dial-result state.
 
 ## Passive bulk throughput signal
 
@@ -123,8 +81,8 @@ only `outbounds`/`providers` uses built-in probe budgets and health gates. In
 mode `1`, an established business context also applies the configured switch
 margin, minimum latency improvement, confirmation samples/window and cooldown
 before a performance migration. Mode `0` retains its healthy incumbent and
-does not make performance-driven migrations. The Zig policy backend owns this
-state in production; a release does not silently switch to the host adapter.
+does not make performance-driven migrations. These transitions are owned by
+the Go Smart runtime in every build.
 
 Active TCP probes use two independent HTTPS targets by default. A custom
 `url` uses the built-in gstatic URL as its fallback; `probe_fallback_url` can
@@ -198,7 +156,7 @@ remain the most recently updated context for older dashboards.
 
 Related subservices use a hierarchical identity. The endpoint portrait is the
 shared baseline and each subservice keeps an independent health ledger, while
-one parent-business Zig context owns the incumbent for all of its domains and
+one parent-business Go context owns the incumbent for all of its domains and
 transports inside the Smart group. For example, ChatGPT Web and the OpenAI API
 use one OpenAI primary; Telegram domain and officially published address
 ranges use one Telegram primary. A site-local or transport-local failure is
@@ -232,9 +190,9 @@ their EWMA values. Provider display-name copies resolve to one endpoint
 portrait only when the complete authenticated outbound configuration matches;
 display-name suffixes alone are not treated as endpoint identity.
 
-New evidence fields must be appended to the ABI or introduced with an ABI
-version; existing field order and enum values are never reused. Any host
-integration must add deterministic parity tests before production enablement.
+Smart policy changes are tested against deterministic Go transition tests.
+The separate adaptive/eBPF C ABI is versioned independently; changes there do
+not change Smart selection semantics.
 
 ## Alternatives rejected
 
@@ -251,11 +209,11 @@ integration must add deterministic parity tests before production enablement.
 
 ## Rollout gates
 
-1. Linux CI tests the release-shaped Go Smart policy with `smart_zig` enabled
-   only for adaptive/eBPF, and independently tests the opt-in Zig Smart ABI.
+1. Linux CI tests the Go Smart implementation both in the normal build and in
+   the release-shaped build where `adaptive_zig` is enabled only for adaptive/eBPF.
 2. Go tests cover confirmation/cooldown, hard-failure bypass, pin handling,
    serialized result order, error classification, and recovery evidence.
 3. A canary records selected endpoint, actual dial events, failure categories,
    breaker transitions, RSS and latency for at least 24 hours.
-4. Smart selection never depends on the Zig ABI in production; the optional
-   experiment cannot silently become a second production state owner.
+4. Smart has no Zig policy backend or build-tag switch; Smart selection never
+   depends on the adaptive/eBPF Zig ABI.

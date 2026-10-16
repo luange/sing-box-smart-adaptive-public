@@ -134,9 +134,9 @@ jobs:
           # adaptive PBR deployment. Do not inherit the upstream "others"
           # bundle (OpenVPN, OCM/CCM, Cloudflared and USBIP add size without
           # being part of this target).
-          tags="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,with_connection_history,with_tailscale,badlinkname,tfogo_checklinkname0,with_ebpf,smart_zig"
-          if [[ ",${tags}," == *",smart_reference,"* || ",${tags}," != *",smart_zig,"* ]]; then
-            echo "production release must enable smart_zig and must not enable smart_reference" >&2
+          tags="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,with_connection_history,with_tailscale,badlinkname,tfogo_checklinkname0,with_ebpf,adaptive_zig"
+          if [[ ",${tags}," != *",with_ebpf,"* || ",${tags}," != *",adaptive_zig,"* || ",${tags}," == *",smart_reference,"* ]]; then
+            echo "production release must enable the adaptive/eBPF Zig policy and must not enable smart_reference" >&2
             exit 1
           fi
           tags="${tags},production_smart"

@@ -7,11 +7,9 @@ import (
 	"github.com/sagernet/sing-box/smart-engine/conformance"
 )
 
-// smartScoreForProfile is a fourth hand-maintained copy of the scoring.zig
-// formula (host-side estimate score). This test pins it to the conformance
-// reference mirror of the Zig kernel across a matrix of estimate shapes and
-// all three traffic profiles, so any drift on either side fails here instead
-// of silently reordering nodes.
+// smartScoreForProfile is pinned to an independent reference model across a
+// matrix of estimate shapes and all traffic profiles, so scoring drift cannot
+// silently reorder nodes.
 func TestSmartScoreForProfileMatchesReference(t *testing.T) {
 	type estimateShape struct {
 		name        string
