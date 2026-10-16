@@ -1,15 +1,14 @@
-//go:build !smart_zig && !production_smart
+//go:build !smart_policy_zig
 
 package group
 
-// The reference Go state machine is kept for ordinary upstream development and
-// conformance tests. Packaged releases add smart_zig; production_smart is an
-// explicit fail-closed profile used to prove that a missing Zig library cannot
-// silently select through this duplicate policy implementation.
+// The Go Smart implementation is the production policy owner. Keeping this
+// constructor nil ensures selection, confirmation, cooldown, and incumbent
+// state all remain in the Smart host rather than being mirrored in an ABI.
 func newSmartPolicyBackend(_ smartPolicyBackendConfig) smartPolicyBackend { return nil }
 
-// Non-production builds remain useful on platforms where the Zig ABI is not
-// available. Release workflows reject this profile before packaging.
+// The Zig Smart experiment is opt-in with smart_policy_zig. The release tag
+// smart_zig remains available to the independent adaptive/eBPF policy kernel.
 func smartPolicyBackendRequired() bool { return false }
 
 func smartPolicyBackendName() string { return "go-reference" }

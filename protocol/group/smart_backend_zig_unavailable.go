@@ -1,10 +1,10 @@
-//go:build smart_zig && !cgo
+//go:build smart_policy_zig && !cgo
 
 package group
 
-// A smart_zig build without cgo cannot link the Zig ABI. Keep this variant
-// compileable so tooling can inspect the package, but fail Smart construction
-// rather than silently selecting through the duplicate Go policy backend.
+// A smart_policy_zig build without cgo cannot link the Zig ABI. Keep this
+// opt-in experiment compileable, but fail Smart construction rather than
+// silently mixing it with the Go policy owner.
 func newSmartPolicyBackend(_ smartPolicyBackendConfig) smartPolicyBackend { return nil }
 
 func smartPolicyBackendRequired() bool { return true }

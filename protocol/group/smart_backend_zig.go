@@ -1,4 +1,4 @@
-//go:build smart_zig && cgo
+//go:build smart_policy_zig && cgo
 
 package group
 

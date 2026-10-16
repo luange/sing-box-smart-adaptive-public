@@ -107,7 +107,7 @@ jobs:
           make -C common/ebpf generate
           ls -la common/ebpf/native/*.o
 
-      - name: Build Zig Smart policy library
+      - name: Build Zig adaptive/eBPF policy library
         working-directory: smart-engine
         run: |
           set -euo pipefail

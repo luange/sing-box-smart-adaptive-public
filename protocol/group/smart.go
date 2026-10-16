@@ -83,6 +83,7 @@ const (
 	defaultSmartSwitchCooldown       = 20 * time.Minute
 	defaultSmartMinSwitchImprovement = 250 * time.Millisecond
 	defaultSmartHedgeDelay           = 450 * time.Millisecond
+	smartDialDiagnosticLimit         = 64
 	minSmartHedgeDelay               = 250 * time.Millisecond
 	// Give a healthy, already-established path a little more time for its
 	// first byte before starting a competing dial.  This reduces Safari/Google
@@ -425,10 +426,9 @@ func (s *Smart) buildCandidateMetadataWithDialIdentity(tag, identity, dialIdenti
 	// use their stable tag and must not be silently omitted from Zig-only builds.
 	policyIdentity := metadata.dialIdentity
 	if identity == "" {
-		// Provider duplicate resolvers append " #deadbeef" or " (2)" to a
-		// display tag. Treat those generated aliases as one policy candidate so
-		// equal lines do not create a false performance challenge.
-		policyIdentity = smartLineFamily(tag)
+		// A generated display suffix is not proof of endpoint equivalence.
+		// Without structured options, keep each complete tag independent.
+		policyIdentity = tag
 	}
 	if policyIdentity == "" {
 		policyIdentity = tag
@@ -454,11 +454,12 @@ type smartRanking struct {
 }
 
 type smartDialAttempt struct {
-	rankIndex    int
-	attemptIndex int
-	rank         smartRank
-	candidate    adapter.Outbound
-	reserved     bool
+	rankIndex        int
+	attemptIndex     int
+	diagnosticFlowID uint64
+	rank             smartRank
+	candidate        adapter.Outbound
+	reserved         bool
 }
 
 type smartDialResult struct {
@@ -545,16 +546,18 @@ type smartControlState struct {
 	temporary       string
 	temporaryUntil  time.Time
 	temporaryReason string
+	revision        uint64
 }
 
 type Smart struct {
 	outbound.Adapter
-	ctx        context.Context
-	outbound   adapter.OutboundManager
-	connection adapter.ConnectionManager
-	network    adapter.NetworkManager
-	logger     log.ContextLogger
-	tags       []string
+	ctx             context.Context
+	outbound        adapter.OutboundManager
+	connection      adapter.ConnectionManager
+	network         adapter.NetworkManager
+	logger          log.ContextLogger
+	tags            []string
+	ownerInstanceID string
 
 	provider              adapter.ProviderManager
 	providerAccess        sync.Mutex
@@ -581,6 +584,7 @@ type Smart struct {
 	useAllProviders        bool
 
 	access                 sync.RWMutex
+	mutationAccess         sync.Mutex
 	candidates             []adapter.Outbound
 	candidateByTag         map[string]adapter.Outbound
 	candidateMetadataByTag map[string]smartCandidateMetadata
@@ -607,15 +611,18 @@ type Smart struct {
 	fingerprint         atomic.Pointer[smartFingerprintCache]
 	fingerprintLock     sync.Mutex
 
-	statusAccess       sync.RWMutex
-	status             adapter.SmartGroupStatus
-	statusContexts     map[string]adapter.SmartContextStatus
-	statusContextOrder []string
-	statusLastAt       time.Time
-	statusLastContext  string
-	statusLastSelected string
-	statusLastReason   string
-	statusLastPhase    string
+	statusAccess          sync.RWMutex
+	outcomeAccess         sync.Mutex
+	status                adapter.SmartGroupStatus
+	statusContexts        map[string]adapter.SmartContextStatus
+	statusContextOrder    []string
+	statusLastAt          time.Time
+	statusLastContext     string
+	statusLastSelected    string
+	statusLastReason      string
+	statusLastPhase       string
+	dialDiagnosticSeq     uint64
+	dialDiagnosticFlowSeq atomic.Uint64
 
 	store                      *smartStore
 	policyBackend              smartPolicyBackend
@@ -893,25 +900,31 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		SelectionMode:        uint8(selectionMode),
 	})
 	if policyBackend == nil && smartPolicyBackendRequired() {
-		return nil, E.New("smart Zig policy backend unavailable; refusing Go policy fallback")
+		return nil, E.New("opt-in Smart Zig policy backend unavailable")
 	}
 	if logger != nil {
 		if policyBackend == nil {
-			logger.Warn("smart policy backend unavailable; using reference Go policy")
+			logger.Info("smart policy owner: native Go state machine")
 		} else {
-			logger.Info("smart policy backend: zig, mode: ", uint8(selectionMode))
+			logger.Info("smart policy backend: opt-in Zig experiment, selection mode: ", uint8(selectionMode))
 		}
 	}
 	outboundManager := service.FromContext[adapter.OutboundManager](ctx)
 	probeRegistry, releaseProbeRegistry := acquireSmartProfileRegistry(ctx, outboundManager)
+	var ownerID [16]byte
+	if _, err := rand.Read(ownerID[:]); err != nil {
+		releaseProbeRegistry()
+		return nil, E.Cause(err, "generate smart owner instance identity")
+	}
 	smart := &Smart{
-		Adapter:    outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
-		ctx:        ctx,
-		outbound:   outboundManager,
-		connection: service.FromContext[adapter.ConnectionManager](ctx),
-		network:    service.FromContext[adapter.NetworkManager](ctx),
-		logger:     logger,
-		tags:       options.Outbounds,
+		Adapter:         outbound.NewAdapter(C.TypeSmart, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
+		ctx:             ctx,
+		outbound:        outboundManager,
+		connection:      service.FromContext[adapter.ConnectionManager](ctx),
+		network:         service.FromContext[adapter.NetworkManager](ctx),
+		logger:          logger,
+		tags:            options.Outbounds,
+		ownerInstanceID: hex.EncodeToString(ownerID[:]),
 
 		provider:        service.FromContext[adapter.ProviderManager](ctx),
 		providers:       make(map[string]adapter.Provider),
@@ -927,7 +940,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 
 		candidateByTag:         make(map[string]adapter.Outbound),
 		candidateMetadataByTag: make(map[string]smartCandidateMetadata),
-		control:                &smartControlState{},
+		control:                &smartControlState{revision: 1},
 		lastSelected:           make(map[string]string),
 		lastSelectedAt:         make(map[string]time.Time),
 		affinity:               make(map[string]smartAffinity),
@@ -1458,6 +1471,7 @@ func (s *Smart) Close() error {
 	// for several seconds. Five smart groups closed serially would otherwise
 	// exceed FatalStopTimeout (10s) and crash with "sing-box did not close!".
 	s.waitWorkerStop(2 * time.Second)
+	s.mutationAccess.Lock()
 	s.access.Lock()
 	clear(s.candidateByTag)
 	clear(s.lastSelected)
@@ -1503,6 +1517,7 @@ func (s *Smart) Close() error {
 	s.providerAccess.Unlock()
 	s.store.clear()
 	s.closePolicyBackend()
+	s.mutationAccess.Unlock()
 	if s.releaseProbeRegistry != nil {
 		s.releaseProbeRegistry()
 		s.releaseProbeRegistry = nil
@@ -2601,7 +2616,7 @@ func (s *Smart) SelectPreMatchOutbound(metadata *adapter.InboundContext, selectO
 
 func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound {
 	now := time.Now()
-	pinned, temporary, _, _ := s.controlSnapshot(now)
+	pinned, temporary, _, _, _ := s.controlSnapshot(now)
 	contextSelected := ""
 	if metadata != nil {
 		transport := smartTransportKey(metadata.Network, metadata.Destination)
@@ -2643,7 +2658,120 @@ func (s *Smart) preMatchLeaf(metadata *adapter.InboundContext) adapter.Outbound 
 }
 
 func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
-	pinned, temporary, expiresAt, reason := s.controlSnapshot(time.Now())
+	status, _, _ := s.smartStatusSnapshot()
+	return status
+}
+
+func (s *Smart) SmartRuntimeStatus() adapter.SmartRuntimeStatus {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	status, ownerID, revision := s.smartStatusSnapshot()
+	return adapter.SmartRuntimeStatus{OwnerInstanceID: ownerID, SelectionRevision: revision, Status: status}
+}
+
+func (s *Smart) SmartEndpointIdentity(tag string) (string, bool) {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	return s.smartEndpointIdentityLocked(tag)
+}
+
+func (s *Smart) SmartEndpointSnapshot(tag string) (adapter.SmartRuntimeStatus, string, bool) {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	if s.closing.Load() {
+		return adapter.SmartRuntimeStatus{}, "", false
+	}
+	status, ownerID, revision := s.smartStatusSnapshot()
+	endpointID, found := s.smartEndpointIdentityLocked(tag)
+	return adapter.SmartRuntimeStatus{OwnerInstanceID: ownerID, SelectionRevision: revision, Status: status}, endpointID, found
+}
+
+func (s *Smart) smartEndpointIdentityLocked(tag string) (string, bool) {
+	if s.closing.Load() {
+		return "", false
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	if _, exists := s.candidateByTag[tag]; !exists {
+		return "", false
+	}
+	metadata, exists := s.candidateMetadataByTag[tag]
+	if !exists {
+		return "", false
+	}
+	endpointID := smartEndpointID(metadata.identity, metadata.policyID)
+	return endpointID, endpointID != ""
+}
+
+func (s *Smart) SmartSetPinnedEndpoint(endpointID, ownerInstanceID string, expectedRevision uint64) (uint64, bool) {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	if s.closing.Load() || ownerInstanceID != s.ownerInstanceID || endpointID == "" {
+		return 0, false
+	}
+	s.access.RLock()
+	tag := ""
+	for _, candidate := range s.candidates {
+		metadata, exists := s.candidateMetadataByTag[candidate.Tag()]
+		if exists && smartEndpointID(metadata.identity, metadata.policyID) == endpointID {
+			tag = candidate.Tag()
+			break
+		}
+	}
+	s.access.RUnlock()
+	if tag == "" {
+		return 0, false
+	}
+	s.control.access.Lock()
+	if s.control.revision != expectedRevision {
+		revision := s.control.revision
+		s.control.access.Unlock()
+		return revision, false
+	}
+	if s.control.pinned != tag {
+		bumpSmartControlRevisionLocked(s.control)
+		s.control.pinned = tag
+	}
+	revision := s.control.revision
+	s.control.access.Unlock()
+	s.resetPolicyBackend()
+	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
+		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil && s.logger != nil {
+			s.logger.Error("store smart pin: ", err)
+		}
+	}
+	return revision, true
+}
+
+func (s *Smart) SmartRestoreAutomatic(ownerInstanceID string, expectedRevision uint64) (uint64, bool) {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	if s.closing.Load() || ownerInstanceID != s.ownerInstanceID {
+		return 0, false
+	}
+	s.control.access.Lock()
+	if s.control.revision != expectedRevision {
+		revision := s.control.revision
+		s.control.access.Unlock()
+		return revision, false
+	}
+	if s.control.pinned != "" {
+		s.control.pinned = ""
+		bumpSmartControlRevisionLocked(s.control)
+	}
+	revision := s.control.revision
+	s.control.access.Unlock()
+	s.resetPolicyBackend()
+	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
+		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil && s.logger != nil {
+			s.logger.Error("clear smart pin: ", err)
+		}
+	}
+	return revision, true
+}
+
+func (s *Smart) smartStatusSnapshot() (adapter.SmartGroupStatus, string, uint64) {
+	pinned, temporary, expiresAt, reason, revision := s.controlSnapshot(time.Now())
 	s.statusAccess.RLock()
 	// Copy all slice/map fields while holding statusAccess. A shallow struct
 	// copy would leave StateCounts and Candidates backed by the live maps/slices
@@ -2720,10 +2848,81 @@ func (s *Smart) SmartStatus() adapter.SmartGroupStatus {
 			}
 		}
 	}
+	status.RecentDialEvents = append([]adapter.SmartDialDiagnostic(nil), status.RecentDialEvents...)
 	s.switchAuditAccess.Lock()
 	status.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), s.switchAudit...)
 	s.switchAuditAccess.Unlock()
-	return status
+	return status, s.ownerInstanceID, revision
+}
+
+func (s *Smart) recordSmartDialDiagnostic(flowID uint64, network, site, transport, candidate string, attempt int, outcome, stage, failureType string, elapsed time.Duration) {
+	endpointID := ""
+	s.access.RLock()
+	if metadata, loaded := s.candidateMetadataByTag[candidate]; loaded {
+		endpointID = smartEndpointID(metadata.identity, metadata.policyID)
+	}
+	s.access.RUnlock()
+
+	s.statusAccess.Lock()
+	s.dialDiagnosticSeq++
+	event := adapter.SmartDialDiagnostic{
+		Sequence:    strconv.FormatUint(s.dialDiagnosticSeq, 10),
+		FlowID:      strconv.FormatUint(flowID, 10),
+		OccurredAt:  time.Now().UTC(),
+		Network:     network,
+		Site:        site,
+		Transport:   transport,
+		Candidate:   candidate,
+		EndpointID:  endpointID,
+		Attempt:     attempt + 1,
+		Outcome:     outcome,
+		Stage:       stage,
+		FailureType: failureType,
+		ElapsedMS:   elapsed.Milliseconds(),
+	}
+	events := append(s.status.RecentDialEvents, event)
+	if len(events) > smartDialDiagnosticLimit {
+		copy(events, events[len(events)-smartDialDiagnosticLimit:])
+		events = events[:smartDialDiagnosticLimit]
+	}
+	s.status.RecentDialEvents = events
+	s.statusAccess.Unlock()
+}
+
+// commitSmartDialSuccess serializes the result-side transaction. The socket
+// has already connected; record that fact, update the health ledger, then
+// publish the chosen incumbent while competing dial completions wait their
+// turn. This gives diagnostics and breaker state one monotonic event order.
+func (s *Smart) commitSmartDialSuccess(flowID uint64, network, site, transport, observedTransport, candidate string, attempt int, elapsed time.Duration, commitSelection func()) {
+	s.outcomeAccess.Lock()
+	defer s.outcomeAccess.Unlock()
+	now := time.Now()
+	s.recordSmartDialDiagnostic(flowID, network, site, transport, candidate, attempt, "connected", "outbound_dial", "", elapsed)
+	s.observeDialForTransport(now, network, site, candidate, transport, observedTransport, true, elapsed)
+	s.recordSharedDataPlaneEvidence(candidate, transport, true)
+	if observedTransport != "" && observedTransport != transport {
+		s.recordSharedDataPlaneEvidence(candidate, observedTransport, true)
+	}
+	if commitSelection != nil {
+		commitSelection()
+	}
+}
+
+// commitSmartDialFailure serializes the failure record with the health update,
+// short quarantine, and pin release. Raw errors stay out of the diagnostic
+// stream; only the stable failure category is exposed.
+func (s *Smart) commitSmartDialFailure(flowID uint64, network, site, transport, observedTransport, candidate string, attempt int, stage string, failureType string, elapsed time.Duration) {
+	s.outcomeAccess.Lock()
+	defer s.outcomeAccess.Unlock()
+	s.recordSmartDialDiagnostic(flowID, network, site, transport, candidate, attempt, "failed", stage, failureType, elapsed)
+	s.observeDataPlaneFailureForTransport(time.Now(), network, site, candidate, transport, observedTransport, elapsed)
+	s.clearBrokenPin(candidate, network, site, transport)
+}
+
+func (s *Smart) recordSmartDialCanceled(flowID uint64, network, site, transport, candidate string, attempt int, elapsed time.Duration) {
+	s.outcomeAccess.Lock()
+	defer s.outcomeAccess.Unlock()
+	s.recordSmartDialDiagnostic(flowID, network, site, transport, candidate, attempt, "canceled", "outbound_dial", "canceled", elapsed)
 }
 
 func cloneSmartContextStatus(source adapter.SmartContextStatus) adapter.SmartContextStatus {
@@ -2762,6 +2961,8 @@ func cloneSmartStateCounts(source map[string]int) map[string]int {
 }
 
 func (s *Smart) SelectOutbound(tag string) bool {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
 	s.access.RLock()
 	candidate, loaded := s.candidateByTag[tag]
 	if !loaded || candidate == nil {
@@ -2771,6 +2972,9 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	metadata := s.candidateMetadataByTag[tag]
 	s.access.RUnlock()
 	s.control.access.Lock()
+	if s.control.pinned != tag {
+		bumpSmartControlRevisionLocked(s.control)
+	}
 	s.control.pinned = tag
 	s.control.pinnedEndpoint = metadata.identity
 	s.control.pinnedDial = metadata.dialIdentity
@@ -2785,7 +2989,12 @@ func (s *Smart) SelectOutbound(tag string) bool {
 }
 
 func (s *Smart) ClearSelection() {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
 	s.control.access.Lock()
+	if s.control.pinned != "" {
+		bumpSmartControlRevisionLocked(s.control)
+	}
 	s.control.pinned = ""
 	s.control.pinnedEndpoint = ""
 	s.control.pinnedDial = ""
@@ -2799,6 +3008,8 @@ func (s *Smart) ClearSelection() {
 }
 
 func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason string) bool {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
@@ -2809,8 +3020,12 @@ func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason st
 	}
 	s.access.RUnlock()
 	s.control.access.Lock()
+	newUntil := time.Now().Add(ttl)
+	if s.control.temporary != tag || !s.control.temporaryUntil.Equal(newUntil) || s.control.temporaryReason != reason {
+		bumpSmartControlRevisionLocked(s.control)
+	}
 	s.control.temporary = tag
-	s.control.temporaryUntil = time.Now().Add(ttl)
+	s.control.temporaryUntil = newUntil
 	s.control.temporaryReason = reason
 	s.control.access.Unlock()
 	if s.logger != nil {
@@ -2820,18 +3035,30 @@ func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason st
 }
 
 func (s *Smart) ClearTemporarySelection() {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
 	s.control.access.Lock()
 	s.clearTemporaryLocked()
 	s.control.access.Unlock()
 }
 
 func (s *Smart) clearTemporaryLocked() {
+	if s.control.temporary != "" || !s.control.temporaryUntil.IsZero() || s.control.temporaryReason != "" {
+		bumpSmartControlRevisionLocked(s.control)
+	}
 	s.control.temporary = ""
 	s.control.temporaryUntil = time.Time{}
 	s.control.temporaryReason = ""
 }
 
-func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, string) {
+func bumpSmartControlRevisionLocked(control *smartControlState) {
+	control.revision++
+	if control.revision == 0 {
+		control.revision = 1
+	}
+}
+
+func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, string, uint64) {
 	s.control.access.Lock()
 	if s.control.temporary != "" && !s.control.temporaryUntil.After(now) {
 		if s.logger != nil {
@@ -2843,13 +3070,14 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 	temporary := s.control.temporary
 	expiresAt := s.control.temporaryUntil
 	reason := s.control.temporaryReason
+	revision := s.control.revision
 	s.control.access.Unlock()
 
 	s.access.RLock()
 	_, temporaryExists := s.candidateByTag[temporary]
 	s.access.RUnlock()
 	if temporary == "" || temporaryExists {
-		return pinned, temporary, expiresAt, reason
+		return pinned, temporary, expiresAt, reason, revision
 	}
 
 	s.control.access.Lock()
@@ -2860,8 +3088,9 @@ func (s *Smart) controlSnapshot(now time.Time) (string, string, time.Time, strin
 	temporary = s.control.temporary
 	expiresAt = s.control.temporaryUntil
 	reason = s.control.temporaryReason
+	revision = s.control.revision
 	s.control.access.Unlock()
-	return pinned, temporary, expiresAt, reason
+	return pinned, temporary, expiresAt, reason, revision
 }
 
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -2926,10 +3155,12 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			observedTransport = transport
 		}
 		adapter.NoteRealOutbound(ctx, candidate)
-		selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
-			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
-			ranks, result.attempt.attemptIndex, result.hadPriorFailure)
-		s.recordActualDialForAttempt(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, result.attempt.rank.selectionGeneration, selectionCommitted)
+		s.commitSmartDialSuccess(result.attempt.diagnosticFlowID, networkKey, siteKey, transport, observedTransport, candidate.Tag(), result.attempt.attemptIndex, result.elapsed, func() {
+			selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
+				ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
+				ranks, result.attempt.attemptIndex, result.hadPriorFailure)
+			s.recordActualDialForAttempt(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, result.attempt.rank.selectionGeneration, selectionCommitted)
+		})
 		conn = s.interruptGroup.NewConnWithKey(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx), smartConnectionKey(networkKey, siteKey, transport, candidate.Tag()))
 		observedStartedAt := time.Now().Add(-result.elapsed)
 		observed := newSmartObservedConnWithRetransmitReason(conn, observedStartedAt, func(firstByte time.Duration) {
@@ -2954,11 +3185,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			if failureType == "" {
 				failureType = "transport"
 			}
-			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, time.Since(observedStartedAt), failureType)
-			if observedTransport != "" && observedTransport != transport {
-				s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), observedTransport, time.Since(observedStartedAt), failureType)
-			}
-			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+			s.commitSmartDialFailure(result.attempt.diagnosticFlowID, networkKey, siteKey, transport, observedTransport, candidate.Tag(), result.attempt.attemptIndex, "established_stream", failureType, time.Since(observedStartedAt))
 			s.requestProbe()
 		}, s.establishedStallTimeout, ctx)
 		if _, wrapped := observed.(smartObservedWrapper); !wrapped {
@@ -3285,8 +3512,23 @@ func (s *Smart) emergencyURLTestRanks(ranks []smartRank, recovered []smartRecove
 
 func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destination M.Socksaddr, attempts []smartDialAttempt, networkKey, siteKey, transport string) (net.Conn, smartDialResult, []error, bool) {
 	dashboardProbe := isSmartDashboardProbe(ctx)
+	diagnosticFlowID := s.dialDiagnosticFlowSeq.Add(1)
+	for index := range attempts {
+		attempts[index].diagnosticFlowID = diagnosticFlowID
+	}
 	parentCtx, cancelAll := context.WithCancel(ctx)
 	defer cancelAll()
+	// A manual pin is an explicit routing choice, not merely the first entry
+	// in a race. Keep it authoritative for this dial: do not start a hedge while
+	// the pinned (or temporary override) candidate is still in flight. If that
+	// candidate actually fails, the ordinary error path below still starts the
+	// next eligible candidate as a failover.
+	pinned, temporary, _, _, _ := s.controlSnapshot(time.Now())
+	strictOverride := temporary
+	if strictOverride == "" {
+		strictOverride = pinned
+	}
+	strictOverridePrimary := len(attempts) > 0 && strictOverride != "" && attempts[0].candidate.Tag() == strictOverride
 	results := make(chan smartDialResult, len(attempts))
 	started := 0
 	defer func() {
@@ -3332,7 +3574,7 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 	var hedgeTimer *time.Timer
 	var hedgeC <-chan time.Time
 	resetHedge := func() {
-		if started >= len(attempts) || active == 0 {
+		if strictOverridePrimary || started >= len(attempts) || active == 0 {
 			if hedgeTimer != nil {
 				hedgeTimer.Stop()
 			}
@@ -3414,15 +3656,28 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 				return nil, smartDialResult{}, append(attemptErrors, parentErr), false
 			}
 			candidate := result.attempt.candidate
+			if errors.Is(result.err, context.Canceled) {
+				s.recordSmartDialCanceled(result.attempt.diagnosticFlowID, networkKey, siteKey, transport, candidate.Tag(), result.attempt.attemptIndex, result.elapsed)
+				if ctx.Err() != nil {
+					cancelAll()
+					return nil, smartDialResult{}, append(attemptErrors, ctx.Err()), false
+				}
+				attemptErrors = append(attemptErrors, E.Cause(result.err, "smart candidate ", candidate.Tag()))
+				if started < len(attempts) {
+					startAttempt(attempts[started])
+					started++
+					active++
+				}
+				resetHedge()
+				continue
+			}
 			if result.err != nil {
 				if dashboardProbe {
 					// A panel check is advisory. It must not quarantine a node or
 					// wake the normal recovery worker because of one probe failure.
 					s.observeProbeResult(true, time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, result.elapsed)
 				} else {
-					failureType := smartFailureType(result.err)
-					s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, result.elapsed, failureType)
-					s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+					s.commitSmartDialFailure(result.attempt.diagnosticFlowID, networkKey, siteKey, transport, "", candidate.Tag(), result.attempt.attemptIndex, "outbound_dial", smartFailureType(result.err), result.elapsed)
 					// A real data-plane failure must wake recovery itself. Dashboard
 					// latency tests may also refresh the shared profile, but production
 					// failover must never depend on a user opening the proxy page. The
@@ -3441,12 +3696,9 @@ func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destina
 			}
 			if dashboardProbe {
 				s.observeProbeResult(true, time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
-			} else {
-				s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
-				s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
-			}
-			if result.observedTransport != "" && result.observedTransport != transport {
-				s.observeProbeResult(dashboardProbe, time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
+				if result.observedTransport != "" && result.observedTransport != transport {
+					s.observeProbeResult(true, time.Now(), networkKey, siteKey, candidate.Tag(), result.observedTransport, true, result.elapsed)
+				}
 			}
 			result.hadPriorFailure = len(attemptErrors) > 0
 			cancelAll()
@@ -3507,6 +3759,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 	}
 	var attemptErrors []error
+	diagnosticFlowID := s.dialDiagnosticFlowSeq.Add(1)
 	attemptCount := 0
 	maxAttempts := s.maxAttempts
 	if maxAttempts <= 0 {
@@ -3552,27 +3805,32 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			return nil, parentErr
 		}
 		if err != nil {
-			failureType := smartFailureType(err)
-			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, elapsed, failureType)
-			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+			if errors.Is(err, context.Canceled) {
+				s.recordSmartDialCanceled(diagnosticFlowID, networkKey, siteKey, transport, candidate.Tag(), attemptIndex, elapsed)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
+				continue
+			}
+			s.commitSmartDialFailure(diagnosticFlowID, networkKey, siteKey, transport, "", candidate.Tag(), attemptIndex, "outbound_dial", smartFailureType(err), elapsed)
 			s.requestProbe()
 			attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
 			continue
 		}
-		s.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
-		s.recordSharedDataPlaneEvidence(candidate.Tag(), transport, true)
 		adapter.NoteRealOutbound(ctx, candidate)
 		endpointID := rank.status.EndpointID
 		if endpointID == "" {
 			endpointID = smartEndpointID(rank.identity, rank.policyID)
 		}
-		selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
-			ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
-			ranks, attemptIndex, attemptIndex > 0)
-		s.recordActualDialForAttempt(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, rank.selectionGeneration, selectionCommitted)
+		s.commitSmartDialSuccess(diagnosticFlowID, networkKey, siteKey, transport, "", candidate.Tag(), attemptIndex, elapsed, func() {
+			selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
+				ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
+				ranks, attemptIndex, attemptIndex > 0)
+			s.recordActualDialForAttempt(smartStatusSelectionKey(networkKey, siteDisplay, transport), endpointID, rank.selectionGeneration, selectionCommitted)
+		})
 		observed := newSmartObservedPacketConnWithWatchdogThreshold(conn, startedAt, smartUDPExpectsResponse(destination), smartUDPRequiredResponsePackets(destination), s.establishedStallTimeout, func(flowElapsed time.Duration) {
-			s.observeDataPlaneFailureWithType(time.Now(), networkKey, siteKey, candidate.Tag(), transport, flowElapsed, "udp_no_response")
-			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+			s.commitSmartDialFailure(diagnosticFlowID, networkKey, siteKey, transport, "", candidate.Tag(), attemptIndex, "udp_response", "no_response", flowElapsed)
 			s.requestProbe()
 		})
 		if _, wrapped := observed.(smartObservedWrapper); !wrapped {
@@ -4545,7 +4803,7 @@ func (s *Smart) candidateProbeIdentity(candidate string) string {
 func (s *Smart) rankPooled(ctx context.Context, transport string, destination M.Socksaddr) (*smartRanking, string, string, string) {
 	now := time.Now()
 	baseTransport := smartTransportBase(transport)
-	pinned, temporary, _, _ := s.controlSnapshot(now)
+	pinned, temporary, _, _, _ := s.controlSnapshot(now)
 	networkKey := s.networkFingerprint()
 	siteDisplay, siteKey := s.resolveSmartSiteIdentity(adapter.ContextFrom(ctx), destination)
 	s.access.RLock()
@@ -5230,7 +5488,7 @@ func smartSameEndpoint(metadataByTag map[string]smartCandidateMetadata, left, ri
 	if leftFound && rightFound {
 		return smartMetadataSameEndpoint(leftMetadata, rightMetadata)
 	}
-	return smartEquivalentLine(left, right)
+	return false
 }
 
 func smartRemapCandidateAlias(tag string, oldMetadataByTag, newMetadataByTag map[string]smartCandidateMetadata, candidates []adapter.Outbound) string {
@@ -5599,7 +5857,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 	if failureType := s.lastFailureType.Load(); failureType != nil {
 		lastFailureType = *failureType
 	}
-	pinned, _, _, _ := s.controlSnapshot(now)
+	pinned, _, _, _, _ := s.controlSnapshot(now)
 	statusCount := min(len(ranks), smartStatusCandidateLimit)
 	s.statusAccess.Lock()
 	// Identical decisions within a short window are coalesced. Selection and
@@ -5690,6 +5948,7 @@ func (s *Smart) updateStatusSelected(networkKey, siteDisplay, transport string, 
 		CandidateDetailsTruncated: len(statuses) < len(ranks),
 		StateCounts:               stateCounts,
 		Candidates:                statuses,
+		RecentDialEvents:          append([]adapter.SmartDialDiagnostic(nil), s.status.RecentDialEvents...),
 	}
 	if s.statusContexts == nil {
 		s.statusContexts = make(map[string]adapter.SmartContextStatus)
@@ -5869,6 +6128,11 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 	if candidate == "" {
 		return false
 	}
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	if s.closing.Load() {
+		return false
+	}
 	s.control.access.Lock()
 	if s.control.pinned != candidate {
 		s.control.access.Unlock()
@@ -5877,6 +6141,7 @@ func (s *Smart) releaseConfirmedBrokenPin(candidate, reason string) bool {
 	s.control.pinned = ""
 	s.control.pinnedEndpoint = ""
 	s.control.pinnedDial = ""
+	bumpSmartControlRevisionLocked(s.control)
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
 	if s.logger != nil {
@@ -5957,6 +6222,8 @@ func (s *Smart) onProviderUpdated(tag string) error {
 }
 
 func (s *Smart) rebuildCandidates(updatedProvider string) error {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
 	if s.closing.Load() {
 		return nil
 	}

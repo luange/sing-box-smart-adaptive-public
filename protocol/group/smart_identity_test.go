@@ -52,6 +52,18 @@ func TestSmartDialIdentitySeparatesCredentialVariants(t *testing.T) {
 	}
 }
 
+func TestSmartSuffixDoesNotProveEndpointEquality(t *testing.T) {
+	smart := &Smart{}
+	left, right := "airport/HK", "airport/HK #deadbeef"
+	metadata := map[string]smartCandidateMetadata{
+		left:  smart.buildCandidateMetadata(left, ""),
+		right: smart.buildCandidateMetadata(right, ""),
+	}
+	if metadata[left].policyID == metadata[right].policyID || smartSameEndpoint(metadata, left, right) {
+		t.Fatal("display-name suffix merged distinct endpoints")
+	}
+}
+
 func TestSmartMetadataAlwaysHasPolicyIdentity(t *testing.T) {
 	smart := &Smart{}
 	metadata := smart.buildCandidateMetadata("static-node", "")

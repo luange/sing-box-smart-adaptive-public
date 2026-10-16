@@ -89,19 +89,22 @@ jobs:
           /tmp/smart_engine_abi
       - name: Go/Zig conformance
         working-directory: smart-engine
-        run: CGO_ENABLED=1 go test -tags smart_zig ./conformance
-      - name: Compile production Smart Zig backend
+        run: CGO_ENABLED=1 go test -tags smart_policy_zig ./conformance
+      - name: Compile opt-in Smart Zig experiment
         run: |
           set -euo pipefail
           cd smart-engine
           zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
           test -s zig-out/lib/libsmart_engine.a
           cd ..
-          CGO_ENABLED=1 go test -tags smart_zig ./protocol/group -run '^$'
+          CGO_ENABLED=1 go test -tags smart_zig,smart_policy_zig ./protocol/group -run '^$'
       - name: Run Smart and transport regression tests
         run: |
           set -euo pipefail
+          # Release-shaped profile: Zig remains for adaptive/eBPF, Smart is Go-owned.
           CGO_ENABLED=1 go test -tags smart_zig ./protocol/group ./transport/v2raywebsocket
+          # Explicit experimental profile validates the separate Smart ABI path.
+          CGO_ENABLED=1 go test -tags smart_zig,smart_policy_zig ./protocol/group ./transport/v2raywebsocket
       - name: Cross-build Linux libraries
         working-directory: smart-engine
         run: |

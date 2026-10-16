@@ -96,6 +96,25 @@ type SmartContextStatus struct {
 	Candidates                []SmartCandidateStatus `json:"candidates"`
 }
 
+// SmartDialDiagnostic is a bounded, privacy-safe observation of one real
+// outbound attempt. It deliberately reports only the stage the core can prove;
+// it never includes destination addresses, raw errors, or credentials.
+type SmartDialDiagnostic struct {
+	Sequence    string    `json:"sequence"`
+	FlowID      string    `json:"flow_id"`
+	OccurredAt  time.Time `json:"occurred_at"`
+	Network     string    `json:"network,omitempty"`
+	Site        string    `json:"site,omitempty"`
+	Transport   string    `json:"transport,omitempty"`
+	Candidate   string    `json:"candidate,omitempty"`
+	EndpointID  string    `json:"endpoint_id,omitempty"`
+	Attempt     int       `json:"attempt"`
+	Outcome     string    `json:"outcome"`
+	Stage       string    `json:"stage"`
+	FailureType string    `json:"failure_type,omitempty"`
+	ElapsedMS   int64     `json:"elapsed_ms"`
+}
+
 // SmartGroupStatus is exported for clash/API status surfaces.
 type SmartGroupStatus struct {
 	Mode uint8 `json:"mode"`
@@ -142,6 +161,7 @@ type SmartGroupStatus struct {
 	ConnectionsKept           uint64                   `json:"connections_kept,omitempty"`
 	StreamFailureWakes        uint64                   `json:"stream_failure_wakes,omitempty"`
 	ProbeTargets              []SmartProbeTargetStatus `json:"probe_targets,omitempty"`
+	RecentDialEvents          []SmartDialDiagnostic    `json:"recent_dial_events,omitempty"`
 	Candidates                []SmartCandidateStatus   `json:"candidates"`
 	Contexts                  []SmartContextStatus     `json:"contexts,omitempty"`
 }
@@ -161,6 +181,27 @@ type SmartProbeTargetStatus struct {
 	LastFailureClass       string `json:"last_failure_class,omitempty"`
 	LastFailureStage       string `json:"last_failure_stage,omitempty"`
 	LastHTTPStatus         int    `json:"last_http_status,omitempty"`
+}
+
+// SmartRuntimeStatus is a private control-plane snapshot. Owner identity and
+// control revision are intentionally separate from the standard Clash status
+// DTO so they are not exposed by legacy API responses.
+type SmartRuntimeStatus struct {
+	OwnerInstanceID   string
+	SelectionRevision uint64
+	Status            SmartGroupStatus
+}
+
+type SmartRuntimeStatusProvider interface {
+	SmartRuntimeStatus() SmartRuntimeStatus
+}
+
+type SmartRuntimeController interface {
+	SmartRuntimeStatusProvider
+	SmartEndpointIdentity(tag string) (string, bool)
+	SmartEndpointSnapshot(tag string) (SmartRuntimeStatus, string, bool)
+	SmartSetPinnedEndpoint(endpointID, ownerInstanceID string, expectedRevision uint64) (uint64, bool)
+	SmartRestoreAutomatic(ownerInstanceID string, expectedRevision uint64) (uint64, bool)
 }
 
 type SmartSwitchAudit struct {

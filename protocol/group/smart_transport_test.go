@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -87,6 +88,48 @@ func TestSmartTransportKeyKeepsAddressFamiliesSeparate(t *testing.T) {
 	}
 	if got := smartTransportBase("tcp/ipv6"); got != N.NetworkTCP {
 		t.Fatalf("family transport base = %q", got)
+	}
+}
+
+func TestSmartFailureTypeUsesSafeErrorClasses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "DNS NXDOMAIN", err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", IsNotFound: true}}, want: "transport"},
+		{name: "DNS timeout", err: &net.DNSError{Err: "i/o timeout", IsTimeout: true}, want: "transport"},
+		{name: "deadline", err: context.DeadlineExceeded, want: "transport"},
+		{name: "canceled", err: context.Canceled, want: "transport"},
+		{name: "refused", err: syscall.ECONNREFUSED, want: "hard_transport"},
+		{name: "reset", err: syscall.ECONNRESET, want: "transport"},
+		{name: "network down", err: syscall.ENETDOWN, want: "transport"},
+		{name: "unreachable", err: syscall.EHOSTUNREACH, want: "hard_transport"},
+		{name: "unknown detail is not exposed", err: errors.New("private credential text"), want: "transport"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := smartFailureType(test.err); got != test.want {
+				t.Fatalf("smartFailureType() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSmartDialDiagnosticsRemainBoundedAndCorrelated(t *testing.T) {
+	var smart Smart
+	for index := uint64(1); index <= smartDialDiagnosticLimit+3; index++ {
+		smart.recordSmartDialDiagnostic(index, "tcp/ipv4", "service:example", "tcp/ipv4", "node-a", 0, "failed", "outbound_dial", "timeout", time.Second)
+	}
+	smart.statusAccess.RLock()
+	defer smart.statusAccess.RUnlock()
+	if got := len(smart.status.RecentDialEvents); got != smartDialDiagnosticLimit {
+		t.Fatalf("diagnostic ring length = %d, want %d", got, smartDialDiagnosticLimit)
+	}
+	first := smart.status.RecentDialEvents[0]
+	last := smart.status.RecentDialEvents[len(smart.status.RecentDialEvents)-1]
+	if first.FlowID != "4" || last.FlowID != "67" || first.Sequence != "4" || last.Sequence != "67" {
+		t.Fatalf("diagnostic ring lost order/correlation: first=%+v last=%+v", first, last)
 	}
 }
 

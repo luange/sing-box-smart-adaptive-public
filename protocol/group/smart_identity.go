@@ -4,8 +4,9 @@ package group
 // provider options when available.  Subscription providers commonly append a
 // numeric suffix to otherwise identical nodes; using the runtime tag as the
 // probe key makes every copy run its own health check and defeats the shared
-// probe registry.  Credentials remain excluded so a password/UUID rotation
-// does not create a second endpoint profile.
+// probe registry. Authentication is part of reachability: two accounts on
+// the same server may have different validity and routing. Hash the complete
+// options, never publish the options themselves, and retire health on rotation.
 
 import (
 	"crypto/sha256"

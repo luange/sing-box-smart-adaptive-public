@@ -445,6 +445,53 @@ func TestSmartDialHedgesSlowCandidateWithinSameRequest(t *testing.T) {
 	}
 }
 
+func TestSmartManualPinDoesNotHedgeToHealthyBackup(t *testing.T) {
+	first := newSmartFakeOutbound("pinned", nil)
+	first.dialDelay = 400 * time.Millisecond
+	second := newSmartFakeOutbound("backup", nil)
+	smart := newTestSmart(first, second)
+	smart.attemptTimeout = 900 * time.Millisecond
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+
+	startedAt := time.Now()
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if elapsed := time.Since(startedAt); elapsed < first.dialDelay {
+		t.Fatalf("manual pin was bypassed by a hedge: elapsed=%s, pinned dial delay=%s", elapsed, first.dialDelay)
+	}
+	peer := <-first.peers
+	defer peer.Close()
+	if first.dials.Load() != 1 || second.dials.Load() != 0 {
+		t.Fatalf("manual pin raced a healthy backup: pinned=%d backup=%d", first.dials.Load(), second.dials.Load())
+	}
+}
+
+func TestSmartManualPinFailureFallsBackSequentially(t *testing.T) {
+	pinned := newSmartFakeOutbound("pinned", errors.New("dial failed"))
+	backup := newSmartFakeOutbound("backup", nil)
+	smart := newTestSmart(pinned, backup)
+	smart.attemptTimeout = time.Second
+	if !smart.SelectOutbound(pinned.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	peer := <-backup.peers
+	defer peer.Close()
+	if pinned.dials.Load() != 1 || backup.dials.Load() != 1 {
+		t.Fatalf("unexpected sequential failover dials: pinned=%d backup=%d", pinned.dials.Load(), backup.dials.Load())
+	}
+}
+
 func TestSmartWaitsForProviderStartup(t *testing.T) {
 	provider := &smartFakeProvider{tag: "airport"}
 	smart := newTestSmart()
@@ -1385,6 +1432,44 @@ func TestSmartDialAttemptsDeduplicatePathAliasesButKeepCredentialVariants(t *tes
 	}
 }
 
+func TestSmartDialSuccessCommitsDiagnosticAndHealthBeforeSelection(t *testing.T) {
+	candidate := newSmartFakeOutbound("node-a", nil)
+	smart := newTestSmart(candidate)
+	network, site, transport := "network-a", "site-a", "tcp/ipv4"
+	selected := false
+	smart.commitSmartDialSuccess(42, network, site, transport, transport, candidate.Tag(), 0, 25*time.Millisecond, func() {
+		status := smart.SmartStatus()
+		if len(status.RecentDialEvents) != 1 || status.RecentDialEvents[0].Outcome != "connected" {
+			t.Fatalf("selection committed before connected diagnostic: %+v", status.RecentDialEvents)
+		}
+		profileID := smart.candidateProfileID(candidate.Tag())
+		estimate := smart.store.estimate(time.Now(), network, site, profileID, transport, smart.minSamples)
+		if estimate.Samples == 0 {
+			t.Fatal("selection committed before successful dial health evidence")
+		}
+		selected = true
+	})
+	if !selected {
+		t.Fatal("selection commit callback did not run")
+	}
+}
+
+func TestSmartCallerCancellationIsObservableButDoesNotPenalizeCandidate(t *testing.T) {
+	candidate := newSmartFakeOutbound("node-a", nil)
+	smart := newTestSmart(candidate)
+	network, site, transport := "network-a", "site-a", "tcp/ipv4"
+	smart.recordSmartDialCanceled(43, network, site, transport, candidate.Tag(), 0, time.Millisecond)
+	status := smart.SmartStatus()
+	if len(status.RecentDialEvents) != 1 || status.RecentDialEvents[0].Outcome != "canceled" {
+		t.Fatalf("canceled dial was not observable: %+v", status.RecentDialEvents)
+	}
+	profileID := smart.candidateProfileID(candidate.Tag())
+	estimate := smart.store.estimate(time.Now(), network, site, profileID, transport, smart.minSamples)
+	if estimate.Samples != 0 || estimate.State == "open" || estimate.State == "suspect" {
+		t.Fatalf("caller cancellation penalized candidate: %+v", estimate)
+	}
+}
+
 func TestSmartFixedPrimaryPreventsMinorOscillation(t *testing.T) {
 	first := newSmartFakeOutbound("first", nil)
 	second := newSmartFakeOutbound("second", nil)
@@ -1404,7 +1489,7 @@ func TestSmartFixedPrimaryPreventsMinorOscillation(t *testing.T) {
 	}
 }
 
-func TestSmartEquivalentSubscriptionLineRemainsFixedWhileHealthy(t *testing.T) {
+func TestSmartUnprovenSubscriptionAliasRequiresSwitchConfirmation(t *testing.T) {
 	primary := newSmartFakeOutbound("airport/香港-广东专线 NeaRoute", nil)
 	duplicate := newSmartFakeOutbound("airport/香港-广东专线 NeaRoute #deadbeef", nil)
 	smart := newTestSmart(primary, duplicate)
@@ -1421,8 +1506,12 @@ func TestSmartEquivalentSubscriptionLineRemainsFixedWhileHealthy(t *testing.T) {
 	if ranks[0].outbound.Tag() != primary.Tag() {
 		t.Fatalf("canonical endpoint alias was not retained: %s", ranks[0].outbound.Tag())
 	}
-	if ranks[0].status.Reason != "equivalent subscription line retained" {
-		t.Fatalf("unexpected equivalent-line reason: %q", ranks[0].status.Reason)
+	wantReason := "fixed primary retained"
+	if smartPolicyBackendRequired() {
+		wantReason = "zig policy retained candidate"
+	}
+	if ranks[0].status.Reason != wantReason {
+		t.Fatalf("unproven alias bypassed normal confirmation: %q", ranks[0].status.Reason)
 	}
 }
 
