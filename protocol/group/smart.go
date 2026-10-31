@@ -1323,21 +1323,6 @@ func (s *Smart) Start() error {
 			s.logger.Info("smart group waiting for provider candidates")
 		}
 	}
-	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
-		var restored bool
-		if store, ok := cacheFile.(adapter.SelectedRecordStore); ok {
-			if record, loaded := store.LoadSelectedRecord(s.Tag()); loaded {
-				if pinned := s.resolveSmartSelectionRecord(record); pinned != "" {
-					restored = s.SelectOutbound(pinned)
-				}
-			}
-		}
-		if !restored {
-			if pinned := cacheFile.LoadSelected(s.Tag()); pinned != "" {
-				s.SelectOutbound(pinned)
-			}
-		}
-	}
 	return nil
 }
 
@@ -2733,11 +2718,6 @@ func (s *Smart) SmartSetPinnedEndpoint(endpointID, ownerInstanceID string, expec
 	revision := s.control.revision
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
-	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil && s.logger != nil {
-			s.logger.Error("store smart pin: ", err)
-		}
-	}
 	return revision, true
 }
 
@@ -2760,11 +2740,6 @@ func (s *Smart) SmartRestoreAutomatic(ownerInstanceID string, expectedRevision u
 	revision := s.control.revision
 	s.control.access.Unlock()
 	s.resetPolicyBackend()
-	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := cacheFile.StoreSelected(s.Tag(), ""); err != nil && s.logger != nil {
-			s.logger.Error("clear smart pin: ", err)
-		}
-	}
 	return revision, true
 }
 
@@ -2784,6 +2759,18 @@ func (s *Smart) smartStatusSnapshot() (adapter.SmartGroupStatus, string, uint64)
 	statusLastContext := s.statusLastContext
 	s.statusAccess.RUnlock()
 	status.Pinned = pinned
+	// A successful pin CAS is itself an authoritative selection decision. Do
+	// not keep publishing the previous automatic incumbent until the next
+	// business dial; that creates a false pin/selected mismatch in the control
+	// plane even though the next dial is already constrained to the pin.
+	if pinned != "" {
+		status.Selected = pinned
+		s.access.RLock()
+		if metadata, loaded := s.candidateMetadataByTag[pinned]; loaded {
+			status.SelectedEndpointID = smartEndpointID(metadata.identity, metadata.policyID)
+		}
+		s.access.RUnlock()
+	}
 	status.TemporaryOverride = temporary
 	status.OverrideReason = reason
 	if temporary != "" {
@@ -2947,6 +2934,9 @@ func cloneSmartGroupStatus(source adapter.SmartGroupStatus) adapter.SmartGroupSt
 	if source.RecentSwitches != nil {
 		result.RecentSwitches = append([]adapter.SmartSwitchAudit(nil), source.RecentSwitches...)
 	}
+	if source.RecentDialEvents != nil {
+		result.RecentDialEvents = append([]adapter.SmartDialDiagnostic(nil), source.RecentDialEvents...)
+	}
 	return result
 }
 
@@ -2973,6 +2963,7 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	metadata := s.candidateMetadataByTag[tag]
 	s.access.RUnlock()
 	s.control.access.Lock()
+	selectionChanged := s.control.pinned != tag
 	if s.control.pinned != tag {
 		bumpSmartControlRevisionLocked(s.control)
 	}
@@ -2980,12 +2971,10 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	s.control.pinnedEndpoint = metadata.identity
 	s.control.pinnedDial = metadata.dialIdentity
 	s.control.access.Unlock()
-	s.resetPolicyBackend()
-	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := storeSelectedRecordValue(cacheFile, s.Tag(), s.smartSelectionRecord(tag)); err != nil {
-			s.logger.Error("store smart pin: ", err)
-		}
+	if selectionChanged {
+		s.interruptManualSelectionConnections("pin", tag)
 	}
+	s.resetPolicyBackend()
 	return true
 }
 
@@ -2993,19 +2982,18 @@ func (s *Smart) ClearSelection() {
 	s.mutationAccess.Lock()
 	defer s.mutationAccess.Unlock()
 	s.control.access.Lock()
-	if s.control.pinned != "" {
+	selectionChanged := s.control.pinned != ""
+	if selectionChanged {
 		bumpSmartControlRevisionLocked(s.control)
 	}
 	s.control.pinned = ""
 	s.control.pinnedEndpoint = ""
 	s.control.pinnedDial = ""
 	s.control.access.Unlock()
-	s.resetPolicyBackend()
-	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil && s.Tag() != "" {
-		if err := clearSelectedRecord(cacheFile, s.Tag()); err != nil {
-			s.logger.Error("clear smart pin: ", err)
-		}
+	if selectionChanged {
+		s.interruptManualSelectionConnections("automatic", "")
 	}
+	s.resetPolicyBackend()
 }
 
 func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason string) bool {
@@ -3022,6 +3010,7 @@ func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason st
 	s.access.RUnlock()
 	s.control.access.Lock()
 	newUntil := time.Now().Add(ttl)
+	selectionChanged := s.control.temporary != tag || s.control.pinned != ""
 	if s.control.temporary != tag || !s.control.temporaryUntil.Equal(newUntil) || s.control.temporaryReason != reason {
 		bumpSmartControlRevisionLocked(s.control)
 	}
@@ -3029,6 +3018,9 @@ func (s *Smart) SelectTemporaryOutbound(tag string, ttl time.Duration, reason st
 	s.control.temporaryUntil = newUntil
 	s.control.temporaryReason = reason
 	s.control.access.Unlock()
+	if selectionChanged {
+		s.interruptManualSelectionConnections("temporary_override", tag)
+	}
 	if s.logger != nil {
 		s.logger.Info("smart temporary override selected: ", tag, " for ", ttl)
 	}
@@ -3039,8 +3031,36 @@ func (s *Smart) ClearTemporarySelection() {
 	s.mutationAccess.Lock()
 	defer s.mutationAccess.Unlock()
 	s.control.access.Lock()
+	selectionChanged := s.control.temporary != ""
 	s.clearTemporaryLocked()
 	s.control.access.Unlock()
+	if selectionChanged {
+		s.interruptManualSelectionConnections("clear_temporary_override", "")
+	}
+}
+
+// interruptManualSelectionConnections makes a manual Smart control change
+// take effect for already-open flows as well as future dials. Smart connection
+// tracking is group-local, so this cannot disturb connections owned by another
+// regional group. Provider/control-plane connections are excluded by the
+// shared interrupt group.
+func (s *Smart) interruptManualSelectionConnections(action, target string) {
+	if s.interruptGroup == nil {
+		return
+	}
+	result := s.interruptGroup.InterruptSelective(interrupt.InterruptPolicy{
+		ForceAll: true,
+		OnInterrupted: func() {
+			s.connectionsInterrupted.Add(1)
+		},
+	})
+	s.connectionsKept.Add(uint64(result.Kept))
+	if result.Interrupted > 0 && s.logger != nil {
+		s.logger.Info("smart manual selection ", action,
+			" target=", target,
+			" interrupted=", result.Interrupted,
+			" kept=", result.Kept)
+	}
 }
 
 func (s *Smart) clearTemporaryLocked() {
@@ -3139,6 +3159,8 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates are circuit-open or recovery-busy")
 		return nil, E.New("all smart candidates are circuit-open or recovery-busy")
 	}
+	pinnedAtDial, _, _, _, _ := s.controlSnapshot(time.Now())
+	pinnedAttemptFailed := pinnedAtDial != "" && len(attempts) > 0 && attempts[0].candidate.Tag() == pinnedAtDial
 	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
 		candidate := result.attempt.candidate
 		endpointID := result.attempt.rank.status.EndpointID
@@ -3157,6 +3179,12 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		}
 		adapter.NoteRealOutbound(ctx, candidate)
 		s.commitSmartDialSuccess(result.attempt.diagnosticFlowID, networkKey, siteKey, transport, observedTransport, candidate.Tag(), result.attempt.attemptIndex, result.elapsed, func() {
+			// A successful fallback after a hard node failure is authoritative proof
+			// that this flow can no longer use the manual pin. Site-local timeouts are
+			// not sufficient evidence to discard a user's persistent choice.
+			if result.hadPriorFailure && pinnedAttemptFailed && candidate.Tag() != pinnedAtDial && smartFirstAttemptHardFailure(attemptErrors) {
+				s.releaseConfirmedBrokenPin(pinnedAtDial, "pinned dial failed; fallback connected")
+			}
 			selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
 				ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
 				ranks, result.attempt.attemptIndex, result.hadPriorFailure)
@@ -3760,6 +3788,8 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		}
 	}
 	var attemptErrors []error
+	pinnedAtDial, _, _, _, _ := s.controlSnapshot(time.Now())
+	pinnedAttemptFailed := pinnedAtDial != "" && len(ranks) > 0 && ranks[0].outbound.Tag() == pinnedAtDial
 	diagnosticFlowID := s.dialDiagnosticFlowSeq.Add(1)
 	attemptCount := 0
 	maxAttempts := s.maxAttempts
@@ -3825,6 +3855,9 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			endpointID = smartEndpointID(rank.identity, rank.policyID)
 		}
 		s.commitSmartDialSuccess(diagnosticFlowID, networkKey, siteKey, transport, "", candidate.Tag(), attemptIndex, elapsed, func() {
+			if attemptIndex > 0 && pinnedAttemptFailed && candidate.Tag() != pinnedAtDial && smartFirstAttemptHardFailure(attemptErrors) {
+				s.releaseConfirmedBrokenPin(pinnedAtDial, "pinned packet dial failed; fallback connected")
+			}
 			selectionCommitted := s.markSelectedWithSnapshot(candidate, networkKey, siteKey, siteDisplay, transport,
 				ranking.snapshotSelected, ranking.snapshotSelectedAt, ranking.snapshotValid,
 				ranks, attemptIndex, attemptIndex > 0)
@@ -4758,29 +4791,6 @@ func (s *Smart) candidateProfileID(candidate string) string {
 		return candidate
 	}
 	return metadata.profileID
-}
-
-func (s *Smart) resolveSmartSelectionRecord(record adapter.SelectedRecord) string {
-	if s == nil {
-		return ""
-	}
-	s.access.RLock()
-	selected := resolveSelectionRecord(s.candidates, record)
-	s.access.RUnlock()
-	if selected == nil {
-		return ""
-	}
-	return selected.Tag()
-}
-
-func (s *Smart) smartSelectionRecord(tag string) adapter.SelectedRecord {
-	record := adapter.SelectedRecord{Version: 1, DisplayTag: tag}
-	s.access.RLock()
-	metadata := s.candidateMetadataByTag[tag]
-	s.access.RUnlock()
-	record.EndpointIdentity = metadata.identity
-	record.DialIdentity = metadata.dialIdentity
-	return record
 }
 
 // candidateProbeIdentity is the credential-free path key used by the bounded
@@ -6161,6 +6171,14 @@ func (s *Smart) onProviderUpdated(tag string) error {
 	if retired {
 		return nil
 	}
+	// A manual Smart pin is a one-shot operator choice for the current provider
+	// catalog. A provider publication can replace credentials, endpoints, or the
+	// health domain behind the same display tag, so retaining that choice would
+	// silently route new traffic through a stale node. Do not interrupt existing
+	// connections: release only the decision used by subsequent dials.
+	if tag != "" {
+		s.releasePinForProviderRefresh(tag)
+	}
 	// Provider callbacks may race with Close, which unregisters callbacks and
 	// clears the provider map under providerAccess.  Keep this lookup under the
 	// same lock as rebuildCandidates/unregisterProviderCallbacks so a late
@@ -6220,6 +6238,29 @@ func (s *Smart) onProviderUpdated(tag string) error {
 		s.logger.Error("rebuild smart candidates from provider ", tag, ": ", err)
 	}
 	return err
+}
+
+func (s *Smart) releasePinForProviderRefresh(providerTag string) {
+	s.mutationAccess.Lock()
+	defer s.mutationAccess.Unlock()
+	if s.closing.Load() {
+		return
+	}
+	s.control.access.Lock()
+	pinned := s.control.pinned
+	if pinned == "" {
+		s.control.access.Unlock()
+		return
+	}
+	s.control.pinned = ""
+	s.control.pinnedEndpoint = ""
+	s.control.pinnedDial = ""
+	bumpSmartControlRevisionLocked(s.control)
+	s.control.access.Unlock()
+	s.resetPolicyBackend()
+	if s.logger != nil {
+		s.logger.Info("smart manual pin released after provider refresh: provider=", providerTag, " tag=", pinned)
+	}
 }
 
 func (s *Smart) rebuildCandidates(updatedProvider string) error {
@@ -6381,7 +6422,6 @@ func (s *Smart) rebuildCandidates(updatedProvider string) error {
 	s.candidateMetadataByTag = candidateMetadataByTag
 	s.access.Unlock()
 	s.providerAccess.Unlock()
-	s.remapPinnedCandidate(candidateMetadataByTag, candidates)
 	if s.store != nil {
 		s.store.pruneCandidates(keepProfiles)
 	}
@@ -6416,34 +6456,6 @@ func (s *Smart) providerCatalogCurrentLocked(providerTags []string, providerRevi
 		}
 	}
 	return true
-}
-
-func (s *Smart) remapPinnedCandidate(metadataByTag map[string]smartCandidateMetadata, candidates []adapter.Outbound) {
-	s.control.access.Lock()
-	if s.control.pinned == "" {
-		s.control.access.Unlock()
-		return
-	}
-	record := adapter.SelectedRecord{
-		Version:          1,
-		DisplayTag:       s.control.pinned,
-		DialIdentity:     s.control.pinnedDial,
-		EndpointIdentity: s.control.pinnedEndpoint,
-	}
-	selected := resolveSelectionRecord(candidates, record)
-	if selected == nil || selected.Tag() == s.control.pinned {
-		s.control.access.Unlock()
-		return
-	}
-	oldTag := s.control.pinned
-	metadata := metadataByTag[selected.Tag()]
-	s.control.pinned = selected.Tag()
-	s.control.pinnedEndpoint = metadata.identity
-	s.control.pinnedDial = metadata.dialIdentity
-	s.control.access.Unlock()
-	if s.logger != nil {
-		s.logger.Info("smart manual pin remapped: ", oldTag, " -> ", selected.Tag())
-	}
 }
 
 func (s *Smart) setCandidatesReadyStatus(candidates []adapter.Outbound) {
@@ -7067,6 +7079,14 @@ func smartFailureType(err error) string {
 		return "hard_transport"
 	}
 	return "transport"
+}
+
+func smartFirstAttemptHardFailure(attemptErrors []error) bool {
+	if len(attemptErrors) == 0 {
+		return false
+	}
+	failureType := smartFailureType(attemptErrors[0])
+	return failureType == "protocol" || failureType == "hard_transport"
 }
 
 // isSmartRequestContextError separates a caller-owned request deadline from a

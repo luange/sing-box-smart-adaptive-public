@@ -116,6 +116,15 @@ func TestSmartFailureTypeUsesSafeErrorClasses(t *testing.T) {
 	}
 }
 
+func TestSmartFirstAttemptHardFailureDoesNotBorrowLaterEvidence(t *testing.T) {
+	if smartFirstAttemptHardFailure([]error{context.DeadlineExceeded, syscall.ECONNREFUSED}) {
+		t.Fatal("a later candidate hard failure must not evict a pin whose own attempt only timed out")
+	}
+	if !smartFirstAttemptHardFailure([]error{syscall.ECONNREFUSED, context.DeadlineExceeded}) {
+		t.Fatal("the pinned first attempt hard failure must release the broken pin after fallback")
+	}
+}
+
 func TestSmartDialDiagnosticsRemainBoundedAndCorrelated(t *testing.T) {
 	var smart Smart
 	for index := uint64(1); index <= smartDialDiagnosticLimit+3; index++ {

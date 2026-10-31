@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -471,6 +472,70 @@ func TestSmartManualPinDoesNotHedgeToHealthyBackup(t *testing.T) {
 	}
 }
 
+func TestSmartProviderRefreshReleasesManualPinWithoutInterruptingConnections(t *testing.T) {
+	pinned := newSmartFakeOutbound("pinned", nil)
+	backup := newSmartFakeOutbound("backup", nil)
+	smart := newTestSmart(pinned, backup)
+	if !smart.SelectOutbound(pinned.Tag()) {
+		t.Fatal("failed to set manual pin")
+	}
+
+	// A provider publication changes the catalog used for future dials. It must
+	// not retain a manual choice from the previous catalog, but it must not tear
+	// down established traffic merely because a subscription refreshed.
+	smart.releasePinForProviderRefresh("airport")
+	status := smart.SmartStatus()
+	if status.Pinned != "" {
+		t.Fatalf("provider refresh retained manual pin: %q", status.Pinned)
+	}
+	if status.ConnectionsInterrupted != 0 {
+		t.Fatalf("provider refresh interrupted existing connections: %d", status.ConnectionsInterrupted)
+	}
+}
+
+func TestSmartChangingManualPinInterruptsExistingGroupConnections(t *testing.T) {
+	first := newSmartFakeOutbound("pinned-first", nil)
+	second := newSmartFakeOutbound("pinned-second", nil)
+	smart := newTestSmart(first, second)
+	if !smart.SelectOutbound(first.Tag()) {
+		t.Fatal("failed to set initial manual pin")
+	}
+
+	oldConn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("chatgpt.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPeer := <-first.peers
+	defer oldPeer.Close()
+
+	if !smart.SelectOutbound(second.Tag()) {
+		t.Fatal("failed to change manual pin")
+	}
+	_ = oldConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err = oldConn.Read(make([]byte, 1)); err == nil {
+		_ = oldConn.Close()
+		t.Fatal("existing connection survived a manual Smart pin change")
+	} else if timeoutError, ok := err.(net.Error); ok && timeoutError.Timeout() {
+		_ = oldConn.Close()
+		t.Fatalf("existing connection was not interrupted by the manual pin change: %v", err)
+	}
+	_ = oldConn.Close()
+
+	newConn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("chatgpt.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newConn.Close()
+	newPeer := <-second.peers
+	defer newPeer.Close()
+	if first.dials.Load() != 1 || second.dials.Load() != 1 {
+		t.Fatalf("manual pin did not route the replacement dial to its target: first=%d second=%d", first.dials.Load(), second.dials.Load())
+	}
+	if got := smart.SmartStatus().ConnectionsInterrupted; got != 1 {
+		t.Fatalf("interrupted-connection counter = %d, want 1", got)
+	}
+}
+
 func TestSmartManualPinFailureFallsBackSequentially(t *testing.T) {
 	pinned := newSmartFakeOutbound("pinned", errors.New("dial failed"))
 	backup := newSmartFakeOutbound("backup", nil)
@@ -489,6 +554,13 @@ func TestSmartManualPinFailureFallsBackSequentially(t *testing.T) {
 	defer peer.Close()
 	if pinned.dials.Load() != 1 || backup.dials.Load() != 1 {
 		t.Fatalf("unexpected sequential failover dials: pinned=%d backup=%d", pinned.dials.Load(), backup.dials.Load())
+	}
+	status := smart.SmartStatus()
+	if status.Pinned != pinned.Tag() {
+		t.Fatalf("site-local fallback cleared a still-authoritative pin: %q", status.Pinned)
+	}
+	if status.ActualDialEndpointID == "" {
+		t.Fatalf("fallback actual dial was not published: %+v", status)
 	}
 }
 
@@ -1216,8 +1288,8 @@ func TestSmartUDPResponseAndOneWayTrafficDoNotFail(t *testing.T) {
 	}
 }
 
-func TestSmartPermanentPinSurvivesTransientFailureThenReleasesAtThreshold(t *testing.T) {
-	first := newSmartFakeOutbound("first", errors.New("dial failed"))
+func TestSmartPermanentPinReleasesWhenHardFailureFallsBack(t *testing.T) {
+	first := newSmartFakeOutbound("first", syscall.ECONNREFUSED)
 	second := newSmartFakeOutbound("second", nil)
 	smart := newTestSmart(first, second)
 	if !smart.SelectOutbound("first") {
@@ -1225,21 +1297,19 @@ func TestSmartPermanentPinSurvivesTransientFailureThenReleasesAtThreshold(t *tes
 	}
 
 	destination := M.ParseSocksaddr("example.com:443")
-	for attempt := 1; attempt <= smart.breakerFailures; attempt++ {
-		conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn.Close()
-		peer := <-second.peers
-		peer.Close()
-		status := smart.SmartStatus()
-		if attempt < smart.breakerFailures && status.Pinned != "first" {
-			t.Fatalf("transient failure %d prematurely cleared pin: %q", attempt, status.Pinned)
-		}
-		if attempt == smart.breakerFailures && status.Pinned != "" {
-			t.Fatalf("confirmed failure did not release pin: %q", status.Pinned)
-		}
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	peer := <-second.peers
+	peer.Close()
+	status := smart.SmartStatus()
+	if status.Pinned != "" {
+		t.Fatalf("connected fallback did not release failed pin: %q", status.Pinned)
+	}
+	if status.Selected != second.Tag() || status.ActualDialEndpointID != status.SelectedEndpointID {
+		t.Fatalf("pin release and fallback commit were not coherent: %+v", status)
 	}
 }
 
@@ -1285,6 +1355,10 @@ func TestSmartDashboardProbeRetainsManualPin(t *testing.T) {
 	}
 	if got := smart.SmartStatus().Pinned; got != first.Tag() {
 		t.Fatalf("dashboard probe released manual pin: %q", got)
+	}
+	status := smart.SmartStatus()
+	if status.Selected != first.Tag() {
+		t.Fatalf("manual pin was not immediately authoritative in status: %+v", status)
 	}
 }
 

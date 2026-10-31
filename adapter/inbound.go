@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,100 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// InboundSnapshotManager provides a copied membership snapshot and a revision
+// that changes on create/remove/manager close and lifecycle progress. Readers
+// must check the revision again after sampling owners before presenting the
+// snapshot as current.
+type InboundSnapshotManager interface {
+	SnapshotInbounds() ([]Inbound, uint64)
+	InboundRevision() uint64
+}
+
+// InboundLifecycleSnapshotManager exposes the manager's authoritative startup
+// progress. The returned revision must match InboundSnapshotManager's revision
+// so callers can fence a combined membership/activity/lifecycle snapshot.
+type InboundLifecycleSnapshotManager interface {
+	SnapshotInboundLifecycle() (state string, stage string, revision uint64)
+}
+
+type EBPFAttachPoint struct {
+	Kind, Interface, Direction, AttachType, AttachmentID, State string
+	IfIndex, ProgramID                                          uint32
+}
+
+// EBPFRuntimeStatusProvider exposes a single inbound's sampled runtime truth.
+// Unknown/unreadable fields must remain unknown and carry a controlled
+// diagnostic; configuration alone is not proof of kernel attachment.
+type EBPFRuntimeStatusProvider interface {
+	PrivateEBPFRuntimeStatus() (EBPFRuntimeStatus, error)
+}
+
+type EBPFRuntimeStatus struct {
+	Tag, Engine, RequestedEngine, FallbackReason, EngineState string
+	DiagnosticCode, RecoveryState, AttachState, TrafficState  string
+	MACPolicyState                                            string
+	DirectEgressState, DirectEgressInterface                  string
+	Enabled, MACQuarantined, DataplaneQuarantined             *bool
+	MACPolicyEnabled                                          *bool
+	MACPolicyRows, DirectEgressMark                           *uint32
+	DirectEgressRecoveries                                    uint64
+	DirectEgressDetail                                        string
+	Generation, ActiveBank                                    *uint32
+	AttachPoints                                              []EBPFAttachPoint
+	TrafficCounters, VerdictCounters                          map[string]uint64
+	CounterEpoch                                              uint64
+}
+
+type EBPFControlSnapshot struct {
+	Enabled, Flags, ActiveBank, Generation, RoutingMark uint32
+}
+
+type EBPFV3RuntimeSnapshot struct {
+	Control EBPFControlSnapshot
+	Stats   []uint64
+}
+
+// EBPFDNSRuntimeProvider exposes exact, bounded counters owned by an eBPF
+// inbound. The returned values must come from live atomics/kernel maps; a
+// provider must return an error rather than inventing zeroes when a live read
+// cannot be completed.
+type EBPFDNSRuntimeProvider interface {
+	PrivateEBPFDNSRuntimeStatus() (EBPFDNSRuntimeStatus, error)
+}
+
+type EBPFDNSRuntimeStatus struct {
+	Tag           string
+	Supported     bool
+	Enabled       bool
+	Engine        string
+	CounterEpoch  uint64
+	ActiveWorkers uint32
+	PeakWorkers   uint32
+	WorkerLimit   uint32
+	QueueDepth    uint32
+	QueuePeak     uint32
+	QueueLimit    uint32
+	Admitted      uint64
+	Completed     uint64
+	Promotes      uint64
+	QueueDrops    uint64
+	Queued        uint64
+	Expired       uint64
+	Coalesced     uint64
+	Filtered      uint64
+	MissingDeps   uint64
+	EvalCount     uint64
+	EvalNanos     uint64
+	EvalLe1MS     uint64
+	EvalLe5MS     uint64
+	EvalLe20MS    uint64
+	EvalGT20MS    uint64
+	V3DNSHint     uint64
+	V3DNSConflict uint64
+	V3FakeIP      uint64
+	HasV3Counters bool
+}
+
 type InboundContext struct {
 	Inbound          string
 	InboundInterface string
@@ -58,8 +153,13 @@ type InboundContext struct {
 
 	// power report
 
-	RouteRule     string
-	RouteOutbound string
+	RouteRule string
+	// RouteRuleIndex identifies the matched route rule in the active router
+	// snapshot. It is diagnostic-only and must not be treated as stable across
+	// configuration reloads.
+	RouteRuleIndex      int
+	RouteRuleIndexValid bool
+	RouteOutbound       string
 
 	// sniffer
 
@@ -133,8 +233,9 @@ type InboundContext struct {
 
 // InboundContextExtended holds optional chain diagnostics (loadbalance/smart).
 type InboundContextExtended struct {
-	RealOutboundChain []string
-	closeReason       atomic.Pointer[closeReasonState]
+	realOutboundChainAccess sync.RWMutex
+	RealOutboundChain       []string
+	closeReason             atomic.Pointer[closeReasonState]
 }
 
 func (c *InboundContext) InitExtended() {
@@ -145,14 +246,19 @@ func (c *InboundContext) InitExtended() {
 
 func (c *InboundContext) AppendRealOutbound(tag string) {
 	c.InitExtended()
+	c.Extended.realOutboundChainAccess.Lock()
 	c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
+	c.Extended.realOutboundChainAccess.Unlock()
 }
 
 func (c *InboundContext) GetRealOutboundChain() []string {
 	if c.Extended == nil {
 		return nil
 	}
-	return c.Extended.RealOutboundChain
+	c.Extended.realOutboundChainAccess.RLock()
+	chain := append([]string(nil), c.Extended.RealOutboundChain...)
+	c.Extended.realOutboundChainAccess.RUnlock()
+	return chain
 }
 
 func (c *InboundContext) ResetRuleCache() {
