@@ -1,3 +1,5 @@
 /native/shared_network.bpf.o
+/native/shared_network_v2.bpf.o
 /native/splice.bpf.o
+/v3/kern/tc.bpf.o
 /v3/kern/xdp.bpf.o
