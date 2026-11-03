@@ -330,7 +330,7 @@ func privateV1RuntimeTelemetry(server *Server) http.HandlerFunc {
 			"sampled_at":          now,
 			"started_at":          startedAt,
 			"uptime_seconds":      int64(now.Sub(startedAt).Seconds()),
-			"process":             map[string]any{"state": "unsupported", "diagnostic": "OS RSS and CPU counters are not yet exposed by this core build"},
+			"process":             readPrivateProcessMetrics(),
 			"runtime": map[string]any{
 				"go_version": runtime.Version(), "goroutines": runtime.NumGoroutine(),
 				"heap_alloc_bytes": memory.HeapAlloc, "heap_inuse_bytes": memory.HeapInuse,
