@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,6 +58,8 @@ type Server struct {
 	logDebug          bool
 	memoryReclaim     *memoryReclaimState
 	memoryConfig      memoryReclaimConfig
+	privateSmartMu    sync.Mutex
+	privateSmartCache map[string]privateV1SmartMutationCache
 
 	externalController       bool
 	externalUI               string
@@ -82,6 +85,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		ctx:               ctx,
 		startedAt:         time.Now().UTC(),
 		processInstanceID: newPrivateProcessInstanceID(),
+		privateSmartCache: make(map[string]privateV1SmartMutationCache),
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		router:            service.FromContext[adapter.Router](ctx),
 		dnsRouter:         service.FromContext[adapter.DNSRouter](ctx),

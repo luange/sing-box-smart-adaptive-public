@@ -1,6 +1,7 @@
 package clashapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -57,6 +58,57 @@ func TestPrivateV1MinimalContractKeepsInstanceIdentity(t *testing.T) {
 	}
 	if runtime.SchemaVersion != 1 || runtime.ProcessInstanceID != capability.ProcessInstanceID || runtime.ProcessID <= 0 || runtime.Runtime.HeapAlloc > runtime.Runtime.HeapInuse || runtime.Runtime.HeapInuse > runtime.Runtime.HeapSys {
 		t.Fatalf("invalid runtime contract: %#v", runtime)
+	}
+}
+
+func TestPrivateV1SmartPinUsesCASAndIdempotency(t *testing.T) {
+	ownerID := "0123456789abcdef0123456789abcdef"
+	smart := &smartStatusTestGroup{
+		Adapter:  outbound.NewAdapter(C.TypeSmart, "US", []string{N.NetworkTCP}, nil),
+		ownerID:  ownerID,
+		revision: 7,
+		status:   adapter.SmartGroupStatus{RecentDialEvents: []adapter.SmartDialDiagnostic{}},
+	}
+	server := &Server{startedAt: time.Now().UTC(), processInstanceID: newPrivateProcessInstanceID(), outbound: &smartStatusTestManager{outbounds: []adapter.Outbound{smart}}, privateSmartCache: make(map[string]privateV1SmartMutationCache)}
+	router := privateV1Router(server)
+	groupID := privateV1SmartGroupID("US")
+	payload := func(revision uint64, endpointID string) []byte {
+		value, err := json.Marshal(privateV1SmartPinRequest{CoreRevision: privateV1CoreRevision(), ProcessInstanceID: server.processInstanceID, OwnerInstanceID: ownerID, ExpectedSelectionRevision: revision, EndpointID: endpointID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	request := func(key string, body []byte) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/smart/groups/"+groupID+"/pin", bytes.NewReader(body))
+		req.Header.Set("Idempotency-Key", key)
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+	key := "0123456789abcdef0123456789abcdef"
+	first := request(key, payload(7, "endpoint:test"))
+	if first.Code != http.StatusOK || smart.revision != 8 {
+		t.Fatalf("first pin status=%d revision=%d body=%s", first.Code, smart.revision, first.Body.String())
+	}
+	second := request(key, payload(7, "endpoint:test"))
+	if second.Code != http.StatusOK || second.Body.String() != first.Body.String() || smart.revision != 8 {
+		t.Fatalf("idempotent retry status=%d revision=%d body=%s", second.Code, smart.revision, second.Body.String())
+	}
+	conflict := request(key, payload(7, "endpoint:other"))
+	if conflict.Code != http.StatusConflict || smart.revision != 8 {
+		t.Fatalf("reused key status=%d revision=%d body=%s", conflict.Code, smart.revision, conflict.Body.String())
+	}
+	restorePayload, err := json.Marshal(privateV1SmartPinRequest{CoreRevision: privateV1CoreRevision(), ProcessInstanceID: server.processInstanceID, OwnerInstanceID: ownerID, ExpectedSelectionRevision: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := httptest.NewRecorder()
+	restoreRequest := httptest.NewRequest(http.MethodDelete, "/smart/groups/"+groupID+"/pin", bytes.NewReader(restorePayload))
+	restoreRequest.Header.Set("Idempotency-Key", "abcdef0123456789abcdef0123456789")
+	router.ServeHTTP(restore, restoreRequest)
+	if restore.Code != http.StatusOK || smart.revision != 9 {
+		t.Fatalf("restore status=%d revision=%d body=%s", restore.Code, smart.revision, restore.Body.String())
 	}
 }
 
