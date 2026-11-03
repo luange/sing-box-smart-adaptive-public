@@ -70,6 +70,11 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}
+	if len(options.InboundInterface) > 0 {
+		item := NewInboundInterfaceItem(options.InboundInterface)
+		rule.items = append(rule.items, item)
+		rule.allItems = append(rule.allItems, item)
+	}
 	if options.IPVersion > 0 {
 		switch options.IPVersion {
 		case 4, 6:

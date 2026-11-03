@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
@@ -19,11 +20,19 @@ import (
 
 var errHTTP2Fallback = E.New("fallback to HTTP/1.1")
 
+const (
+	h2FallbackAuthorityLimit = 1024
+	h2FallbackAuthorityTTL   = time.Hour
+)
+
 type http2FallbackTransport struct {
-	h2Transport       *http2.Transport
-	h1Transport       *http1Transport
-	fallbackAccess    sync.RWMutex
-	fallbackAuthority map[string]struct{}
+	h2Transport    *http2.Transport
+	h1Transport    *http1Transport
+	fallbackAccess sync.RWMutex
+	// Fallback authorities are learned from remote servers. They must never be
+	// retained indefinitely: a user can proxy an unbounded stream of unique
+	// host names through one long-lived core.
+	fallbackAuthority map[string]time.Time
 }
 
 func newHTTP2FallbackTransport(rawDialer N.Dialer, baseTLSConfig tls.Config, options option.HTTP2Options) (*http2FallbackTransport, error) {
@@ -38,7 +47,7 @@ func newHTTP2FallbackTransport(rawDialer N.Dialer, baseTLSConfig tls.Config, opt
 	return &http2FallbackTransport{
 		h2Transport:       h2Transport,
 		h1Transport:       h1,
-		fallbackAuthority: make(map[string]struct{}),
+		fallbackAuthority: make(map[string]time.Time),
 	}, nil
 }
 
@@ -46,10 +55,21 @@ func (t *http2FallbackTransport) isH2Fallback(authority string) bool {
 	if authority == "" {
 		return false
 	}
+	now := time.Now()
 	t.fallbackAccess.RLock()
-	_, found := t.fallbackAuthority[authority]
+	expiresAt, found := t.fallbackAuthority[authority]
 	t.fallbackAccess.RUnlock()
-	return found
+	if !found || !now.Before(expiresAt) {
+		if found {
+			t.fallbackAccess.Lock()
+			if expiresAt, stillFound := t.fallbackAuthority[authority]; stillFound && !now.Before(expiresAt) {
+				delete(t.fallbackAuthority, authority)
+			}
+			t.fallbackAccess.Unlock()
+		}
+		return false
+	}
+	return true
 }
 
 func (t *http2FallbackTransport) markH2Fallback(authority string) {
@@ -57,7 +77,23 @@ func (t *http2FallbackTransport) markH2Fallback(authority string) {
 		return
 	}
 	t.fallbackAccess.Lock()
-	t.fallbackAuthority[authority] = struct{}{}
+	now := time.Now()
+	for cachedAuthority, expiresAt := range t.fallbackAuthority {
+		if !now.Before(expiresAt) {
+			delete(t.fallbackAuthority, cachedAuthority)
+		}
+	}
+	if _, exists := t.fallbackAuthority[authority]; !exists && len(t.fallbackAuthority) >= h2FallbackAuthorityLimit {
+		var oldestAuthority string
+		var oldestExpiry time.Time
+		for cachedAuthority, expiresAt := range t.fallbackAuthority {
+			if oldestExpiry.IsZero() || expiresAt.Before(oldestExpiry) {
+				oldestAuthority, oldestExpiry = cachedAuthority, expiresAt
+			}
+		}
+		delete(t.fallbackAuthority, oldestAuthority)
+	}
+	t.fallbackAuthority[authority] = now.Add(h2FallbackAuthorityTTL)
 	t.fallbackAccess.Unlock()
 }
 

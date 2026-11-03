@@ -177,6 +177,14 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
+		// Smart is a destination-aware dialer, not a selector facade. It exposes
+		// OutboundGroup for control-plane status and connection ownership, but a
+		// route must leave it in the chain so Smart.DialContext can rank the
+		// actual destination. Resolving Selected here races a cold start and
+		// turns a healthy candidate catalog into "TCP is not supported".
+		if _, isSmart := outbound.(adapter.SmartGroup); isSmart {
+			break
+		}
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break

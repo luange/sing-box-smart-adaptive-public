@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 )
 
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
+
+type socketProtectState struct{ protectFunc control.Func }
 
 type NetworkManager struct {
 	ctx                     context.Context
@@ -69,6 +72,7 @@ type NetworkManager struct {
 	resetRunAccess          sync.Mutex
 	powerUpdateAccess       sync.Mutex
 	powerUpdateCancel       context.CancelFunc
+	socketProtectState      atomic.Pointer[socketProtectState]
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -377,6 +381,28 @@ func (r *NetworkManager) ProtectFunc() control.Func {
 		}
 	}
 	return nil
+}
+
+func (r *NetworkManager) RegisterSocketProtectFunc(protectFunc control.Func) error {
+	if protectFunc == nil {
+		return E.New("socket protect function is nil")
+	}
+	if !r.socketProtectState.CompareAndSwap(nil, &socketProtectState{protectFunc: protectFunc}) {
+		return E.New("a socket protect function is already registered")
+	}
+	return nil
+}
+
+func (r *NetworkManager) UnregisterSocketProtectFunc() { r.socketProtectState.Store(nil) }
+
+func (r *NetworkManager) SocketProtectFunc() control.Func {
+	return func(network string, address string, conn syscall.RawConn) error {
+		state := r.socketProtectState.Load()
+		if state == nil {
+			return nil
+		}
+		return state.protectFunc(network, address, conn)
+	}
 }
 
 func (r *NetworkManager) DefaultOptions() adapter.NetworkOptions {

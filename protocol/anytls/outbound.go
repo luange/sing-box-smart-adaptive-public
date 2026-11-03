@@ -84,7 +84,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 }
 
 func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
-	if stage != adapter.StartStateInitialize {
+	if stage != adapter.StartStateInitialize && stage != adapter.StartStateStart {
+		return nil
+	}
+	if h.client != nil {
 		return nil
 	}
 	client, err := anytls.NewClient(h.clientOptions)

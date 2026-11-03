@@ -4,11 +4,20 @@ import "context"
 
 type contextKeyIsExternalConnection struct{}
 
-func ContextWithIsExternalConnection(ctx context.Context, isExternal bool) context.Context {
-	return context.WithValue(ctx, contextKeyIsExternalConnection{}, isExternal)
+func ContextWithIsExternalConnection(ctx context.Context, _ ...bool) context.Context {
+	return context.WithValue(ctx, contextKeyIsExternalConnection{}, true)
 }
 
 func IsExternalConnectionFromContext(ctx context.Context) bool {
-	isExternal, _ := ctx.Value(contextKeyIsExternalConnection{}).(bool)
-	return isExternal
+	return ctx.Value(contextKeyIsExternalConnection{}) != nil
+}
+
+type contextKeyIsProviderConnection struct{}
+
+func ContextWithIsProviderConnection(ctx context.Context) context.Context {
+	return context.WithValue(ctx, contextKeyIsProviderConnection{}, true)
+}
+
+func IsProviderConnectionFromContext(ctx context.Context) bool {
+	return ctx.Value(contextKeyIsProviderConnection{}) != nil
 }

@@ -27,6 +27,7 @@ type TrackerMetadata struct {
 	Rule         adapter.Rule
 	Outbound     string
 	OutboundType string
+	CloseReason  adapter.ConnectionCloseReason
 }
 
 type Tracker interface {
@@ -142,6 +143,14 @@ func (t *flowTracker) FlowEstablished() {
 }
 
 func (t *flowTracker) CloseFlow(reason tun.FlowCloseReason) {
+	switch reason {
+	case tun.FlowCloseTimeout:
+		t.metadata.CloseReason = adapter.CloseReasonIdleTimeout
+	case tun.FlowCloseFinished:
+		t.metadata.CloseReason = adapter.CloseReasonRemoteEOF
+	default:
+		t.metadata.CloseReason = adapter.CloseReasonRemoteReset
+	}
 	t.manager.leave(t)
 }
 

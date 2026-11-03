@@ -76,13 +76,30 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	} else {
 		info.Put("history", []*adapter.URLTestHistory{})
 	}
-	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
+	if smart, isSmart := detour.(adapter.SmartGroup); isSmart {
+		// Smart satisfies the legacy OutboundGroup surface for compatibility,
+		// but its selection and health state are core-owned. Put the complete
+		// read-only snapshot on the standard Clash proxy response so panels do
+		// not have to infer it from the displayed `now` field.
+		info.Put("now", smart.Now())
+		info.Put("all", smart.All())
+		info.Put("smart", smart.SmartStatus())
+	} else if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
 		var now string
 		if selected := group.Selected(N.NetworkTCP); selected != nil {
 			now = selected.Tag()
 		}
 		info.Put("now", now)
 		info.Put("all", group.All())
+	} else if smart, isSmart := detour.(interface {
+		Now() string
+		All() []string
+	}); isSmart {
+		// Smart owns selection inside DialContext. Deliberately do not make it
+		// implement OutboundGroup merely for display: route.resolveOutbound
+		// would then try to resolve a leaf before Smart can rank a request.
+		info.Put("now", smart.Now())
+		info.Put("all", smart.All())
 	}
 	return &info
 }
@@ -242,7 +259,11 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 				})
 			}
 			for _, detour := range server.outbound.Outbounds() {
-				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
+				// A leaf /delay is an observation only.  URLTest keeps the
+				// legacy refresh hook, but Smart deliberately does not: waking
+				// its worker here lets a dashboard ping race the ordered
+				// selection state and can replace the visible leaf.
+				urlTestGroup, isURLTestGroup := detour.(*group.URLTest)
 				if !isURLTestGroup {
 					continue
 				}

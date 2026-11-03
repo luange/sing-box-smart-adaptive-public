@@ -3,6 +3,7 @@
 package httpclient
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -16,6 +17,16 @@ func TestHTTP3BrokenAuthorityIsolation(t *testing.T) {
 	}
 	if transport.h3Broken("b.example:443") {
 		t.Fatal("b.example:443 must not be affected by marking a.example")
+	}
+}
+
+func TestHTTP3BrokenAuthorityCacheIsBounded(t *testing.T) {
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
+	for i := 0; i < h3BrokenAuthorityLimit+1; i++ {
+		transport.markH3Broken(fmt.Sprintf("host-%d.example:443", i))
+	}
+	if got := len(transport.broken); got != h3BrokenAuthorityLimit {
+		t.Fatalf("broken authority entries = %d, want %d", got, h3BrokenAuthorityLimit)
 	}
 }
 

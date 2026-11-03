@@ -20,6 +20,7 @@ type _Options struct {
 	NTP                  *NTPOptions           `json:"ntp,omitempty"`
 	Certificate          *CertificateOptions   `json:"certificate,omitempty"`
 	CertificateProviders []CertificateProvider `json:"certificate_providers,omitempty"`
+	Providers            []Provider            `json:"providers,omitempty"`
 	HTTPClients          []HTTPClient          `json:"http_clients,omitempty"`
 	NetworkNamespaces    []NetworkNamespace    `json:"network_namespaces,omitempty"`
 	Endpoints            []Endpoint            `json:"endpoints,omitempty"`
@@ -89,6 +90,10 @@ func checkOptions(options *Options) error {
 	if err != nil {
 		return err
 	}
+	err = checkProviders(options.Providers)
+	if err != nil {
+		return err
+	}
 	err = checkHTTPClients(options.HTTPClients)
 	if err != nil {
 		return err
@@ -105,6 +110,21 @@ func checkCertificateProviders(providers []CertificateProvider) error {
 		}
 		if seen[tag] {
 			return E.New("duplicate certificate provider tag: ", tag)
+		}
+		seen[tag] = true
+	}
+	return nil
+}
+
+func checkProviders(providers []Provider) error {
+	seen := make(map[string]bool)
+	for i, provider := range providers {
+		tag := provider.Tag
+		if tag == "" {
+			tag = F.ToString(i)
+		}
+		if seen[tag] {
+			return E.New("duplicate provider tag: ", tag)
 		}
 		seen[tag] = true
 	}

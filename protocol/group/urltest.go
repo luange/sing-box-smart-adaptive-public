@@ -41,6 +41,7 @@ type URLTest struct {
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
+	network                      adapter.NetworkManager
 	logger                       log.ContextLogger
 	tags                         []string
 	link                         string
@@ -110,9 +111,7 @@ func (s *URLTest) Selected(network string) adapter.Outbound {
 	} else {
 		outbound = s.group.selectedOutboundTCP
 	}
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
-	}
+	outbound, _ = s.group.currentOrSelect(outbound, network)
 	return outbound
 }
 
@@ -177,13 +176,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
-	}
+	outbound, _ = s.group.currentOrSelect(outbound, network)
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	started := time.Now()
 	conn, err := outbound.DialContext(ctx, network, destination)
+	s.group.recordSharedHealth(outbound, network, err, time.Since(started), ctx)
 	if err == nil {
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
@@ -194,14 +193,13 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
-	if outbound == nil {
-		outbound, _ = s.group.Select(N.NetworkUDP)
-	}
+	outbound, _ := s.group.currentOrSelect(s.group.selectedOutboundUDP, N.NetworkUDP)
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	started := time.Now()
 	conn, err := outbound.ListenPacket(ctx, destination)
+	s.group.recordSharedHealth(outbound, N.NetworkUDP, err, time.Since(started), ctx)
 	if err == nil {
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
@@ -213,6 +211,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 type URLTestGroup struct {
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
+	network                      adapter.NetworkManager
 	pause                        pause.Manager
 	pauseCallback                *list.Element[pause.Callback]
 	logger                       log.Logger
@@ -231,6 +230,8 @@ type URLTestGroup struct {
 	updateAccess                 sync.Mutex
 	ticker                       *time.Ticker
 	close                        chan struct{}
+	closeOnce                    sync.Once
+	releaseHealthStore           func()
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
 }
@@ -252,9 +253,10 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
-	return &URLTestGroup{
+	group := &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
+		network:                      service.FromContext[adapter.NetworkManager](ctx),
 		logger:                       logger,
 		outbounds:                    outbounds,
 		link:                         link,
@@ -266,7 +268,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
-	}, nil
+	}
+	_, group.releaseHealthStore = acquireNodeHealthStore(outboundManager)
+	return group, nil
 }
 
 func (g *URLTestGroup) PostStart() {
@@ -294,16 +298,22 @@ func (g *URLTestGroup) Touch() {
 }
 
 func (g *URLTestGroup) Close() error {
-	g.access.Lock()
-	defer g.access.Unlock()
-	if g.ticker == nil {
-		return nil
-	}
-	g.ticker.Stop()
-	g.ticker = nil
-	g.pause.UnregisterCallback(g.pauseCallback)
-	g.pauseCallback = nil
-	close(g.close)
+	g.closeOnce.Do(func() {
+		g.access.Lock()
+		if g.ticker != nil {
+			g.ticker.Stop()
+			g.ticker = nil
+		}
+		if g.pauseCallback != nil {
+			g.pause.UnregisterCallback(g.pauseCallback)
+			g.pauseCallback = nil
+		}
+		close(g.close)
+		g.access.Unlock()
+		if g.releaseHealthStore != nil {
+			g.releaseHealthStore()
+		}
+	})
 	return nil
 }
 
@@ -326,8 +336,24 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 			}
 		}
 	}
+	healthStore := sharedNodeHealthStore(g.outbound)
+	networkKey := nodeHealthNetworkKey(g.network)
+	hasHealthyCandidate := false
+	for _, detour := range g.outbounds {
+		if common.Contains(detour.Network(), network) && !nodeHealthCircuitOpen(healthStore, networkKey, detour, network, time.Now()) {
+			hasHealthyCandidate = true
+			break
+		}
+	}
+	if hasHealthyCandidate && minOutbound != nil && nodeHealthCircuitOpen(healthStore, networkKey, minOutbound, network, time.Now()) {
+		minOutbound = nil
+		minDelay = 0
+	}
 	for _, detour := range g.outbounds {
 		if !common.Contains(detour.Network(), network) {
+			continue
+		}
+		if hasHealthyCandidate && nodeHealthCircuitOpen(healthStore, networkKey, detour, network, time.Now()) {
 			continue
 		}
 		history := g.history.LoadURLTestHistory(RealTag(detour, network))
@@ -390,9 +416,97 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.healthEligibleOutbounds(N.NetworkTCP), g.link, g.interval, force)
+	g.recordSharedHealthEvidence(result)
 	g.performUpdateCheck()
 	return result, nil
+}
+
+// healthEligibleOutbounds gives active probes the same confirmed-circuit gate
+// used by selection.  A URLTest group must not continually spend probes on a
+// node which the shared data-plane health store has already quarantined while
+// another compatible candidate remains.  If every candidate is quarantined,
+// return the original set so normal URL tests can supply a recovery path.
+func (g *URLTestGroup) healthEligibleOutbounds(network string) []adapter.Outbound {
+	store := sharedNodeHealthStore(g.outbound)
+	if store == nil {
+		return g.outbounds
+	}
+	now := time.Now()
+	networkKey := nodeHealthNetworkKey(g.network)
+	eligible := make([]adapter.Outbound, 0, len(g.outbounds))
+	for _, detour := range g.outbounds {
+		if common.Contains(detour.Network(), network) && !nodeHealthCircuitOpen(store, networkKey, detour, network, now) {
+			eligible = append(eligible, detour)
+		}
+	}
+	if len(eligible) == 0 {
+		return g.outbounds
+	}
+	return eligible
+}
+
+func (g *URLTestGroup) isCircuitEligible(outbound adapter.Outbound, network string) bool {
+	return !nodeHealthCircuitOpen(sharedNodeHealthStore(g.outbound), nodeHealthNetworkKey(g.network), outbound, network, time.Now())
+}
+
+// currentOrSelect preserves a cached choice only while it remains eligible in
+// the shared data-plane health pool. This is used by Selected and real dial
+// paths alike so a circuit opened by another policy takes effect immediately.
+func (g *URLTestGroup) currentOrSelect(current adapter.Outbound, network string) (adapter.Outbound, bool) {
+	if current != nil && g.isCircuitEligible(current, network) {
+		return current, true
+	}
+	return g.Select(network)
+}
+
+func (g *URLTestGroup) recordSharedHealth(selected adapter.Outbound, network string, dialErr error, elapsed time.Duration, requestCtx context.Context) {
+	recordSharedNodeHealthDial(g.outbound, g.network, selected, network, dialErr, elapsed, requestCtx)
+}
+
+// recordSharedHealthEvidence contributes successful active probes to the
+// core NodeHealthStore without changing breaker state. A URL test proves only
+// that its own target was reachable; failures are deliberately not promoted
+// into data-plane penalties, while successes improve the common cold-start
+// portrait used by Smart and the other group policies.
+func (g *URLTestGroup) recordSharedHealthEvidence(result map[string]uint16) {
+	store := sharedNodeHealthStore(g.outbound)
+	if store == nil || len(result) == 0 {
+		return
+	}
+	now := time.Now()
+	networkKey := nodeHealthNetworkKey(g.network)
+	for tag, delay := range result {
+		if delay == 0 {
+			continue
+		}
+		detour := g.outboundForHealthResult(tag)
+		if detour == nil {
+			continue
+		}
+		profile := nodeHealthProfileIDForNetwork(detour, N.NetworkTCP)
+		if profile == "" {
+			continue
+		}
+		store.retainExternalProfile(profile)
+		store.observeDialAdvisory(now, networkKey, "", profile, N.NetworkTCP, true, time.Duration(delay)*time.Millisecond)
+	}
+}
+
+// outboundForHealthResult resolves recursive URLTest result tags through the
+// runtime outbound manager. Nested groups return leaf tags rather than the
+// outer group's direct member tags, so looking only in g.outbounds silently
+// discarded their otherwise valid advisory evidence.
+func (g *URLTestGroup) outboundForHealthResult(tag string) adapter.Outbound {
+	if detour, loaded := g.outbound.Outbound(tag); loaded {
+		return detour
+	}
+	for _, detour := range g.outbounds {
+		if detour.Tag() == tag {
+			return detour
+		}
+	}
+	return nil
 }
 
 type urlTestResult struct {
@@ -527,4 +641,14 @@ func (g *URLTestGroup) performUpdateCheck() {
 	if selected {
 		g.history.NotifyUpdated()
 	}
+}
+
+func (s *URLTest) Now() string {
+	if s.group == nil {
+		return ""
+	}
+	if outbound := s.group.selectedOutboundTCP; outbound != nil {
+		return outbound.Tag()
+	}
+	return ""
 }

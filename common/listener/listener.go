@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/settings"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -34,6 +35,8 @@ type Listener struct {
 	setSystemProxy           bool
 	systemProxySOCKS         bool
 	tproxy                   bool
+	socketControl            control.Func
+	forceNoMPTCP             bool
 
 	tcpListener          net.Listener
 	systemProxy          settings.SystemProxy
@@ -57,6 +60,8 @@ type Options struct {
 	SetSystemProxy           bool
 	SystemProxySOCKS         bool
 	TProxy                   bool
+	SocketControl            control.Func
+	ForceNoMPTCP             bool
 }
 
 func New(
@@ -75,6 +80,8 @@ func New(
 		setSystemProxy:           options.SetSystemProxy,
 		systemProxySOCKS:         options.SystemProxySOCKS,
 		tproxy:                   options.TProxy,
+		socketControl:            options.SocketControl,
+		forceNoMPTCP:             options.ForceNoMPTCP,
 	}
 }
 

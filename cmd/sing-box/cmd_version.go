@@ -33,7 +33,7 @@ func printVersion(cmd *cobra.Command, args []string) {
 	version += "Environment: " + runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + "\n"
 
 	var tags string
-	var revision string
+	revision := C.Revision
 
 	debugInfo, loaded := debug.ReadBuildInfo()
 	if loaded {
@@ -42,7 +42,9 @@ func printVersion(cmd *cobra.Command, args []string) {
 			case "-tags":
 				tags = setting.Value
 			case "vcs.revision":
-				revision = setting.Value
+				if revision == "" {
+					revision = setting.Value
+				}
 			}
 		}
 	}

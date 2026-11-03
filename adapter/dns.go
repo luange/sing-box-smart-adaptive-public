@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -41,6 +42,63 @@ type DNSQueryOptions struct {
 	Timeout                time.Duration
 	ClientSubnet           netip.Prefix
 	RemoveClientSubnet     bool
+}
+
+// DNSAnswerObserver receives successful A/AAAA answers after userspace DNS
+// routing. It is deliberately observational: failures in an observer never
+// affect DNS delivery.
+type DNSAnswerObserver interface {
+	OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool)
+}
+
+// DNSAnswerObserverHub allows independently configured eBPF inbounds to
+// consume the same routed DNS answer stream without competing for a context
+// service registration.
+type DNSAnswerObserverHub struct {
+	access    sync.Mutex
+	observers []DNSAnswerObserver
+}
+
+func NewDNSAnswerObserverHub() *DNSAnswerObserverHub { return &DNSAnswerObserverHub{} }
+
+func (h *DNSAnswerObserverHub) Add(observer DNSAnswerObserver) {
+	if h == nil || observer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for _, existing := range h.observers {
+		if existing == observer {
+			return
+		}
+	}
+	h.observers = append(h.observers, observer)
+}
+
+func (h *DNSAnswerObserverHub) Remove(observer DNSAnswerObserver) {
+	if h == nil || observer == nil {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	for index, existing := range h.observers {
+		if existing == observer {
+			h.observers = append(h.observers[:index], h.observers[index+1:]...)
+			return
+		}
+	}
+}
+
+func (h *DNSAnswerObserverHub) OnDNSAnswer(domain string, addresses []netip.Addr, fromFakeIP bool) {
+	if h == nil {
+		return
+	}
+	h.access.Lock()
+	observers := append([]DNSAnswerObserver(nil), h.observers...)
+	h.access.Unlock()
+	for _, observer := range observers {
+		observer.OnDNSAnswer(domain, addresses, fromFakeIP)
+	}
 }
 
 type RDRCStore interface {

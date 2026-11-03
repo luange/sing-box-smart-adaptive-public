@@ -28,6 +28,9 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
+	if l.socketControl != nil {
+		listenConfig.Control = control.Append(listenConfig.Control, l.socketControl)
+	}
 	if l.listenOptions.BindInterface != "" {
 		listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(service.FromContext[adapter.NetworkManager](l.ctx).InterfaceFinder(), l.listenOptions.BindInterface, -1))
 	}
@@ -57,6 +60,9 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	}
 	if l.listenOptions.TCPMultiPath {
 		listenConfig.SetMultipathTCP(true)
+	}
+	if l.forceNoMPTCP {
+		listenConfig.SetMultipathTCP(false)
 	}
 	if l.tproxy {
 		listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {

@@ -13,6 +13,11 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
+type ConnectionHistorySink interface {
+	ConnectionOpened(metadata TrackerMetadata)
+	ConnectionClosed(metadata TrackerMetadata)
+}
+
 type ConnectionEventType int
 
 const (
@@ -41,8 +46,10 @@ type Manager struct {
 	closedUploadTotal       int64
 	closedDownloadTotal     int64
 
-	eventSubscriber *observable.Subscriber[ConnectionEvent]
-	eventObserver   *observable.Observer[ConnectionEvent]
+	eventSubscriber   *observable.Subscriber[ConnectionEvent]
+	eventObserver     *observable.Observer[ConnectionEvent]
+	historySinkAccess sync.RWMutex
+	historySink       ConnectionHistorySink
 }
 
 func NewManager() *Manager {
@@ -76,9 +83,20 @@ func (m *Manager) UnSubscribeEvents(subscription observable.Subscription[Connect
 	m.eventObserver.UnSubscribe(subscription)
 }
 
+func (m *Manager) SetConnectionHistorySink(sink ConnectionHistorySink) {
+	m.historySinkAccess.Lock()
+	m.historySink = sink
+	m.historySinkAccess.Unlock()
+}
+
 func (m *Manager) join(tracker Tracker) {
 	metadata := tracker.Metadata()
 	m.connections.Store(metadata.ID, tracker)
+	m.historySinkAccess.RLock()
+	if m.historySink != nil {
+		m.historySink.ConnectionOpened(*metadata)
+	}
+	m.historySinkAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventNew,
 		ID:       metadata.ID,
@@ -97,6 +115,7 @@ func (m *Manager) leave(tracker Tracker) {
 	}
 	metadata.ClosedAt = closedAt
 	metadataCopy := *metadata
+	metadataCopy.Chain = append([]string(nil), metadata.Chain...)
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		evicted := m.closedConnections.PopFront()
 		m.closedUploadTotal += evicted.Upload.Load()
@@ -104,6 +123,11 @@ func (m *Manager) leave(tracker Tracker) {
 	}
 	m.closedConnections.PushBack(metadataCopy)
 	m.closedConnectionsAccess.Unlock()
+	m.historySinkAccess.RLock()
+	if m.historySink != nil {
+		m.historySink.ConnectionClosed(metadataCopy)
+	}
+	m.historySinkAccess.RUnlock()
 	m.eventSubscriber.Emit(ConnectionEvent{
 		Type:     ConnectionEventClosed,
 		ID:       metadata.ID,

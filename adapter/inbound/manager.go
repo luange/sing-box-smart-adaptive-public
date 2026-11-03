@@ -2,10 +2,12 @@ package inbound
 
 import (
 	"context"
+	"os"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -70,5 +72,16 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.inbounds = append(m.inbounds, inbound)
 	m.inboundByTag[tag] = inbound
+	return nil
+}
+
+func (m *Manager) Remove(tag string) error {
+	m.access.Lock()
+	inbound, found := m.inboundByTag[tag]
+	if !found { m.access.Unlock(); return os.ErrNotExist }
+	delete(m.inboundByTag, tag)
+	m.inbounds = common.Filter(m.inbounds, func(it adapter.Inbound) bool { return it.Tag() != tag })
+	m.access.Unlock()
+	if closer, ok := inbound.(interface{ Close() error }); ok { return closer.Close() }
 	return nil
 }

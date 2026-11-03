@@ -139,6 +139,7 @@ func logicalProperties(node *schema.Node, nestedRef *schema.Node) {
 
 type RawDefaultRule struct {
 	Inbound                  badoption.Listable[string]                                                  `json:"inbound,omitempty" reference:"inbound"`
+	InboundInterface         badoption.Listable[string]                                                  `json:"inbound_interface,omitempty"`
 	IPVersion                int                                                                         `json:"ip_version,omitempty" enum:"4,6"`
 	Network                  badoption.Listable[string]                                                  `json:"network,omitempty" enum:"tcp,udp,icmp"`
 	AuthUser                 badoption.Listable[string]                                                  `json:"auth_user,omitempty"`

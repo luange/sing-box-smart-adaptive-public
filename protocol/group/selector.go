@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -34,6 +35,7 @@ type Selector struct {
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
+	network                      adapter.NetworkManager
 	logger                       logger.ContextLogger
 	tags                         []string
 	defaultTag                   string
@@ -49,6 +51,7 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, nil, options.Outbounds),
 		ctx:                          ctx,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
+		network:                      service.FromContext[adapter.NetworkManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		defaultTag:                   options.Default,
@@ -87,6 +90,11 @@ func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		s.outbounds[tag] = detour
 	}
+	_, releaseHealthStore := acquireNodeHealthStore(s.outbound)
+	scope.Add(func() error {
+		releaseHealthStore()
+		return nil
+	})
 
 	if s.Tag() != "" {
 		cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
@@ -106,6 +114,18 @@ func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		detour, loaded := s.outbounds[s.defaultTag]
 		if !loaded {
 			return E.New("default outbound not found: ", s.defaultTag)
+		}
+		// A configured default is an automatic starting point, not a persisted
+		// manual choice. If the shared core health store has a confirmed open
+		// breaker, start from another eligible leaf instead.
+		if nodeHealthCircuitOpen(sharedNodeHealthStore(s.outbound), nodeHealthNetworkKey(s.network), detour, N.NetworkTCP, time.Now()) {
+			for _, candidateTag := range s.tags {
+				candidate := s.outbounds[candidateTag]
+				if !nodeHealthCircuitOpen(sharedNodeHealthStore(s.outbound), nodeHealthNetworkKey(s.network), candidate, N.NetworkTCP, time.Now()) {
+					detour = candidate
+					break
+				}
+			}
 		}
 		s.selected.Store(detour)
 		return nil
@@ -160,7 +180,10 @@ func (s *Selector) SelectOutbound(tag string) bool {
 }
 
 func (s *Selector) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	conn, err := s.selected.Load().DialContext(ctx, network, destination)
+	selected := s.selected.Load()
+	started := time.Now()
+	conn, err := selected.DialContext(ctx, network, destination)
+	s.recordSharedHealth(selected, network, err, time.Since(started), ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -168,16 +191,23 @@ func (s *Selector) DialContext(ctx context.Context, network string, destination 
 }
 
 func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	conn, err := s.selected.Load().ListenPacket(ctx, destination)
+	selected := s.selected.Load()
+	started := time.Now()
+	conn, err := selected.ListenPacket(ctx, destination)
+	s.recordSharedHealth(selected, N.NetworkUDP, err, time.Since(started), ctx)
 	if err != nil {
 		return nil, err
 	}
 	return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 }
 
+func (s *Selector) recordSharedHealth(selected adapter.Outbound, network string, dialErr error, elapsed time.Duration, requestCtx context.Context) {
+	recordSharedNodeHealthDial(s.outbound, s.network, selected, network, dialErr, elapsed, requestCtx)
+}
+
 func RealTag(detour adapter.Outbound, network string) string {
 	for {
-		group, isGroup := detour.(adapter.OutboundGroup)
+		group, isGroup := detour.(interface{ Selected(string) adapter.Outbound })
 		if !isGroup {
 			return detour.Tag()
 		}
@@ -186,4 +216,11 @@ func RealTag(detour adapter.Outbound, network string) string {
 			return ""
 		}
 	}
+}
+
+func (s *Selector) Now() string {
+	if outbound := s.selected.Load(); outbound != nil {
+		return outbound.Tag()
+	}
+	return ""
 }

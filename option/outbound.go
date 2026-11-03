@@ -19,6 +19,14 @@ type OutboundOptionsRegistry interface {
 	CreateOptions(outboundType string) (any, bool)
 }
 
+// OutboundSupportRegistry distinguishes a decode-only schema from a runtime
+// constructor. Provider imports use it to discard a member that this binary
+// cannot instantiate instead of failing an entire subscription refresh.
+type OutboundSupportRegistry interface {
+	OutboundOptionsRegistry
+	IsSupported(outboundType string) bool
+}
+
 type _Outbound struct {
 	Type    string `json:"type"`
 	Tag     string `json:"tag,omitempty"`

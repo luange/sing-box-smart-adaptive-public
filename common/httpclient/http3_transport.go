@@ -29,6 +29,8 @@ type http3BrokenEntry struct {
 	backoff time.Duration
 }
 
+const h3BrokenAuthorityLimit = 1024
+
 type http3FallbackTransport struct {
 	h3Transport   *http3.Transport
 	h2Fallback    innerTransport
@@ -317,6 +319,24 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 	}
 	t.brokenAccess.Lock()
 	defer t.brokenAccess.Unlock()
+	now := time.Now()
+	// Expiration used to be lazy on a repeat request to the same authority.
+	// That lets a stream of one-off failed hosts grow this map forever.
+	for cachedAuthority, cached := range t.broken {
+		if cached.until.IsZero() || !now.Before(cached.until) {
+			delete(t.broken, cachedAuthority)
+		}
+	}
+	if _, exists := t.broken[authority]; !exists && len(t.broken) >= h3BrokenAuthorityLimit {
+		var oldestAuthority string
+		var oldestUntil time.Time
+		for cachedAuthority, cached := range t.broken {
+			if oldestUntil.IsZero() || cached.until.Before(oldestUntil) {
+				oldestAuthority, oldestUntil = cachedAuthority, cached.until
+			}
+		}
+		delete(t.broken, oldestAuthority)
+	}
 	entry := t.broken[authority]
 	if entry.backoff == 0 {
 		entry.backoff = 5 * time.Minute
@@ -326,7 +346,7 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 			entry.backoff = 48 * time.Hour
 		}
 	}
-	entry.until = time.Now().Add(entry.backoff)
+	entry.until = now.Add(entry.backoff)
 	t.broken[authority] = entry
 }
 

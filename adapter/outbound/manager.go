@@ -15,10 +15,17 @@ import (
 var _ adapter.OutboundManager = (*Manager)(nil)
 
 type Manager struct {
-	registry                adapter.OutboundRegistry
-	endpoint                adapter.EndpointManager
-	defaultTag              string
-	access                  sync.RWMutex
+	registry   adapter.OutboundRegistry
+	endpoint   adapter.EndpointManager
+	defaultTag string
+	access     sync.RWMutex
+	// scope and stage are the authoritative lifecycle frontier. Providers may
+	// publish outbounds after the initial configuration has been constructed;
+	// those outbounds must be brought through every already-completed stage
+	// before they become visible to consumers such as Smart.
+	scope                   *adapter.Scope
+	stage                   adapter.StartStage
+	started                 bool
 	outbounds               []adapter.Outbound
 	outboundByTag           map[string]adapter.Outbound
 	defaultOutbound         adapter.Outbound
@@ -40,6 +47,11 @@ func (m *Manager) Initialize(defaultOutboundFallback func() (adapter.Outbound, e
 
 func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.access.Lock()
+	if m.started && m.stage >= stage {
+		m.access.Unlock()
+		return E.New("outbound manager already started at ", m.stage)
+	}
+	m.scope = scope
 	if stage == adapter.StartStateInitialize {
 		if m.defaultTag != "" && m.defaultOutbound == nil {
 			defaultEndpoint, loaded := m.endpoint.Get(m.defaultTag)
@@ -63,18 +75,61 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	outbounds := m.outbounds
 	m.access.Unlock()
 	if stage == adapter.StartStateStart {
-		return m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
-	}
-	for _, outbound := range outbounds {
-		lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
-		if !isLifecycle {
-			continue
-		}
-		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
-		err := scope.Start(name, lifecycle, stage)
+		err := m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
 		if err != nil {
 			return err
 		}
+	} else {
+		for _, outbound := range outbounds {
+			lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
+			if !isLifecycle {
+				continue
+			}
+			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+			err := scope.Start(name, lifecycle, stage)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	m.access.Lock()
+	m.started = true
+	m.stage = stage
+	m.access.Unlock()
+	return nil
+}
+
+// startDynamicOutbound advances a just-created outbound through the lifecycle
+// frontier captured by Start.  In particular, a provider can create members
+// after the manager's initialize phase but before or after its start phase.
+// Leaving such members merely registered makes the control plane advertise
+// objects whose protocol clients were never initialized.
+func (m *Manager) startDynamicOutbound(scope *adapter.Scope, stage adapter.StartStage, outbound adapter.Outbound) error {
+	if scope == nil {
+		return nil
+	}
+	lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
+	if isLifecycle {
+		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+		for _, currentStage := range adapter.ListStartStages {
+			if currentStage > stage {
+				break
+			}
+			if err := scope.Start(name, lifecycle, currentStage); err != nil {
+				return E.Cause(err, "start dynamic ", name)
+			}
+		}
+		return nil
+	}
+	if stage < adapter.StartStateStart {
+		return nil
+	}
+	name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+	if starter, ok := outbound.(adapter.SimpleLifecycle); ok {
+		if err := starter.Start(); err != nil {
+			return E.Cause(err, "start dynamic ", name)
+		}
+		scope.Add(starter.Close)
 	}
 	return nil
 }
@@ -104,14 +159,17 @@ func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbo
 				}
 				continue
 			}
-			lifecycle, isLifecycle := outboundToStart.(adapter.Lifecycle)
-			if !isLifecycle {
-				continue
-			}
 			name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
-			err := scope.Start(name, lifecycle, adapter.StartStateStart)
-			if err != nil {
-				return err
+			if lifecycle, isLifecycle := outboundToStart.(adapter.Lifecycle); isLifecycle {
+				err := scope.Start(name, lifecycle, adapter.StartStateStart)
+				if err != nil {
+					return err
+				}
+			} else if starter, isStarter := outboundToStart.(adapter.SimpleLifecycle); isStarter {
+				if err := starter.Start(); err != nil {
+					return E.Cause(err, "start ", name)
+				}
+				scope.Add(starter.Close)
 			}
 		}
 		if len(started) == len(outbounds) {
@@ -174,16 +232,55 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
+	// Do not hold the registry lock while running lifecycle callbacks. A
+	// protocol initializer is allowed to resolve a detour through this manager.
+	m.access.RLock()
+	scope, stage, started := m.scope, m.stage, m.started
+	m.access.RUnlock()
+	if started {
+		if err = m.startDynamicOutbound(scope, stage, outbound); err != nil {
+			_ = common.Close(outbound)
+			return err
+		}
+	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	_, loaded := m.outboundByTag[tag]
-	if loaded {
-		return E.New("duplicate outbound tag: ", tag)
+	previous := m.outboundByTag[tag]
+	if previous != nil {
+		m.outbounds = common.Filter(m.outbounds, func(it adapter.Outbound) bool { return it.Tag() != tag })
 	}
 	m.outbounds = append(m.outbounds, outbound)
 	m.outboundByTag[tag] = outbound
 	if tag == m.defaultTag || (m.defaultTag == "" && m.defaultOutbound == nil) {
 		m.defaultOutbound = outbound
+	}
+	m.access.Unlock()
+	if previous != nil {
+		// Provider refreshes are upserts. Publish the fully initialized
+		// replacement first, then retire the old leaf so no observer sees a
+		// transient missing tag.
+		if err = common.Close(previous); err != nil {
+			return E.Cause(err, "close replaced outbound: ", tag)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) Remove(tag string) error {
+	m.access.Lock()
+	if tag == m.defaultTag || (m.defaultOutbound != nil && m.defaultOutbound.Tag() == tag) {
+		m.access.Unlock()
+		return E.New("cannot remove default outbound: ", tag)
+	}
+	outbound, found := m.outboundByTag[tag]
+	if !found {
+		m.access.Unlock()
+		return os.ErrNotExist
+	}
+	delete(m.outboundByTag, tag)
+	m.outbounds = common.Filter(m.outbounds, func(it adapter.Outbound) bool { return it.Tag() != tag })
+	m.access.Unlock()
+	if closer, ok := outbound.(interface{ Close() error }); ok {
+		return closer.Close()
 	}
 	return nil
 }

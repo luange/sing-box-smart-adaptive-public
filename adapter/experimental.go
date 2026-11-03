@@ -2,14 +2,24 @@ package adapter
 
 import (
 	"bytes"
+	"io"
 	"context"
 	"encoding/binary"
-	"io"
 	"time"
 
+	"github.com/sagernet/sing-box/common/hash"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
 )
+
+type ClashServer interface {
+	LifecycleService
+	Mode() string
+	ModeList() []string
+	SetMode(mode string)
+	AddModeUpdateHook(hook *observable.Subscriber[struct{}])
+}
 
 type URLTestHistory struct {
 	Time  time.Time `json:"time"`
@@ -19,6 +29,26 @@ type URLTestHistory struct {
 type V2RayServer interface {
 	LifecycleService
 	StatsService() ConnectionTracker
+}
+
+// SelectedRecord is the versioned identity of a persisted group selection.
+// DisplayTag is a UI alias and may change when a provider refreshes duplicate
+// names; the identity fields keep the selection attached to the same
+// endpoint across refreshes and restarts. Identities are opaque hashes and
+// must never contain credentials or subscription URLs.
+type SelectedRecord struct {
+	Version          uint8  `json:"version"`
+	DisplayTag       string `json:"display_tag,omitempty"`
+	DialIdentity     string `json:"dial_identity,omitempty"`
+	EndpointIdentity string `json:"endpoint_identity,omitempty"`
+}
+
+// SelectedRecordStore is an optional extension implemented by cache files
+// that understand identity-aware persisted selections. Keeping it separate
+// from CacheFile preserves compatibility with external CacheFile providers.
+type SelectedRecordStore interface {
+	LoadSelectedRecord(group string) (SelectedRecord, bool)
+	StoreSelectedRecord(group string, record SelectedRecord) error
 }
 
 type CacheFile interface {
@@ -47,13 +77,20 @@ type CacheFile interface {
 	StoreGroupExpand(group string, expand bool) error
 	LoadRuleSet(tag string) *SavedBinary
 	SaveRuleSet(tag string, set *SavedBinary) error
+
+	LoadSubscription(tag string) *SavedBinary
+	SaveSubscription(tag string, sub *SavedBinary) error
 }
 
 type SavedBinary struct {
 	Content     []byte
 	LastUpdated time.Time
 	LastEtag    string
-	URLHash     []byte
+	// URLHash belongs to the official rule-set cache format. Hash is kept
+	// separately for provider subscription identity and is serialized by the
+	// provider cache codec, not by MarshalBinary.
+	URLHash []byte
+	Hash    hash.HashType
 }
 
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {
@@ -151,13 +188,25 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 
 type OutboundGroup interface {
 	Outbound
+	Now() string
 	All() []string
 	Selected(network string) Outbound
-	AttachConnection(closer io.Closer) (detach func())
+	AttachConnection(closer io.Closer) func()
 }
 
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
 	PerformUpdateCheck()
+}
+
+// DashboardURLTestGroup is the bounded, non-fan-out probe surface used by
+// control-plane clients such as Zashboard.  It is intentionally separate from
+// URLTest: the latter is the full group check used by the configured scheduler,
+// while a dashboard request must never turn into one dial per provider alias.
+// Implementations must share their normal endpoint registry/scheduler and may
+// return a partial result when the caller's deadline expires.
+type DashboardURLTestGroup interface {
+	OutboundGroup
+	DashboardURLTest(ctx context.Context) (map[string]uint16, error)
 }

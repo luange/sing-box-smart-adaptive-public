@@ -1,37 +1,29 @@
 package httpclient
 
 import (
+	"fmt"
 	"testing"
+	"time"
 )
 
-func TestHTTP2FallbackAuthorityIsolation(t *testing.T) {
-	transport := &http2FallbackTransport{fallbackAuthority: make(map[string]struct{})}
-
-	transport.markH2Fallback("a.example:443")
-	if !transport.isH2Fallback("a.example:443") {
-		t.Fatal("a.example:443 should be marked")
+func TestHTTP2FallbackAuthorityCacheIsBoundedAndExpires(t *testing.T) {
+	transport := &http2FallbackTransport{fallbackAuthority: make(map[string]time.Time)}
+	for i := 0; i < h2FallbackAuthorityLimit+1; i++ {
+		transport.markH2Fallback(fmt.Sprintf("host-%d.example", i))
 	}
-	if transport.isH2Fallback("b.example:443") {
-		t.Fatal("b.example:443 must remain unmarked after marking a.example")
+	if got := len(transport.fallbackAuthority); got != h2FallbackAuthorityLimit {
+		t.Fatalf("fallback authority entries = %d, want %d", got, h2FallbackAuthorityLimit)
 	}
-
-	transport.markH2Fallback("b.example:443")
-	if !transport.isH2Fallback("b.example:443") {
-		t.Fatal("b.example:443 should be marked after explicit mark")
+	transport.fallbackAccess.Lock()
+	transport.fallbackAuthority["expired.example"] = time.Now().Add(-time.Second)
+	transport.fallbackAccess.Unlock()
+	if transport.isH2Fallback("expired.example") {
+		t.Fatal("expired fallback authority remained active")
 	}
-	if !transport.isH2Fallback("a.example:443") {
-		t.Fatal("a.example:443 mark must survive marking another authority")
-	}
-}
-
-func TestHTTP2FallbackEmptyAuthorityNoOp(t *testing.T) {
-	transport := &http2FallbackTransport{fallbackAuthority: make(map[string]struct{})}
-
-	transport.markH2Fallback("")
-	if len(transport.fallbackAuthority) != 0 {
-		t.Fatalf("empty authority must not be stored, got %d entries", len(transport.fallbackAuthority))
-	}
-	if transport.isH2Fallback("") {
-		t.Fatal("isH2Fallback must be false for empty authority")
+	transport.fallbackAccess.RLock()
+	_, found := transport.fallbackAuthority["expired.example"]
+	transport.fallbackAccess.RUnlock()
+	if found {
+		t.Fatal("expired fallback authority was not removed")
 	}
 }

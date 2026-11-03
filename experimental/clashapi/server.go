@@ -41,18 +41,22 @@ func init() {
 var _ adapter.LifecycleService = (*Server)(nil)
 
 type Server struct {
-	ctx            context.Context
-	network        adapter.NetworkManager
-	router         adapter.Router
-	dnsRouter      adapter.DNSRouter
-	outbound       adapter.OutboundManager
-	endpoint       adapter.EndpointManager
-	logger         log.Logger
-	httpServer     *http.Server
-	trafficManager *trafficcontrol.Manager
-	urlTestHistory *urltest.HistoryStorage
-	clashMode      *clashmode.Manager
-	logDebug       bool
+	ctx               context.Context
+	startedAt         time.Time
+	processInstanceID string
+	network           adapter.NetworkManager
+	router            adapter.Router
+	dnsRouter         adapter.DNSRouter
+	outbound          adapter.OutboundManager
+	endpoint          adapter.EndpointManager
+	logger            log.Logger
+	httpServer        *http.Server
+	trafficManager    *trafficcontrol.Manager
+	urlTestHistory    *urltest.HistoryStorage
+	clashMode         *clashmode.Manager
+	logDebug          bool
+	memoryReclaim     *memoryReclaimState
+	memoryConfig      memoryReclaimConfig
 
 	externalController       bool
 	externalUI               string
@@ -75,13 +79,15 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 	}
 	chiRouter := chi.NewRouter()
 	s := &Server{
-		ctx:       ctx,
-		network:   service.FromContext[adapter.NetworkManager](ctx),
-		router:    service.FromContext[adapter.Router](ctx),
-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
-		outbound:  service.FromContext[adapter.OutboundManager](ctx),
-		endpoint:  service.FromContext[adapter.EndpointManager](ctx),
-		logger:    logFactory.NewLogger("clash-api"),
+		ctx:               ctx,
+		startedAt:         time.Now().UTC(),
+		processInstanceID: newPrivateProcessInstanceID(),
+		network:           service.FromContext[adapter.NetworkManager](ctx),
+		router:            service.FromContext[adapter.Router](ctx),
+		dnsRouter:         service.FromContext[adapter.DNSRouter](ctx),
+		outbound:          service.FromContext[adapter.OutboundManager](ctx),
+		endpoint:          service.FromContext[adapter.EndpointManager](ctx),
+		logger:            logFactory.NewLogger("clash-api"),
 		httpServer: &http.Server{
 			Addr:    options.ExternalController,
 			Handler: chiRouter,
@@ -93,6 +99,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
+	}
+	if config, enabled := newMemoryReclaimConfig(options.MemoryReclaim); enabled {
+		s.memoryReclaim = &memoryReclaimState{startedAt: time.Now()}
+		s.memoryConfig = config
 	}
 	//goland:noinspection GoDeprecation
 	//nolint:staticcheck
@@ -127,6 +137,8 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		r.Mount("/smart", smartRouter(s))
+		r.Mount("/private/v1", privateV1Router(s))
 
 		s.setupMetaAPI(r)
 	})
@@ -151,6 +163,10 @@ func (s *Server) Name() string {
 func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStarted {
 		return nil
+	}
+	if s.memoryReclaim != nil {
+		go s.memoryReclaim.run(s.ctx, s.memoryConfig)
+		s.logger.Info("memory reclaim enabled: interval=", s.memoryConfig.interval, ", cooldown=", s.memoryConfig.cooldown, ", min_idle=", s.memoryConfig.minimumIdle)
 	}
 	if s.externalController {
 		s.checkAndDownloadExternalUI()

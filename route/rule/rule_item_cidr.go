@@ -93,3 +93,12 @@ func (r *IPCIDRItem) Match(metadata *adapter.InboundContext) bool {
 func (r *IPCIDRItem) String() string {
 	return r.description
 }
+
+// Prefixes returns the canonical prefix list for a destination-only CIDR
+// matcher.  Source matchers must never be used as a destination eBPF policy.
+func (r *IPCIDRItem) Prefixes() []netip.Prefix {
+	if r == nil || r.isSource || r.ipSet == nil {
+		return nil
+	}
+	return r.ipSet.Prefixes()
+}

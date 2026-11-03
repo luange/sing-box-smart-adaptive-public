@@ -15,6 +15,11 @@ type EndpointOptionsRegistry interface {
 	CreateOptions(endpointType string) (any, bool)
 }
 
+type EndpointSupportRegistry interface {
+	EndpointOptionsRegistry
+	IsSupported(endpointType string) bool
+}
+
 type _Endpoint struct {
 	Type    string `json:"type"`
 	Tag     string `json:"tag,omitempty"`

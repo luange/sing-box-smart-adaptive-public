@@ -5,8 +5,10 @@ const (
 	TypeRedirect           = "redirect"
 	TypeTProxy             = "tproxy"
 	TypeDirect             = "direct"
+	TypeEBPF               = "ebpf"
 	TypeBridge             = "bridge"
 	TypeBlock              = "block"
+	TypePass               = "pass"
 	TypeDNS                = "dns"
 	TypeSOCKS              = "socks"
 	TypeHTTP               = "http"
@@ -49,8 +51,11 @@ const (
 )
 
 const (
-	TypeSelector = "selector"
-	TypeURLTest  = "urltest"
+	TypeSelector     = "selector"
+	TypeURLTest      = "urltest"
+	TypeLoadBalance  = "loadbalance"
+	TypeSmart        = "smart"
+	TypeAdaptivePool = "adaptive_pool"
 )
 
 func ProxyDisplayName(proxyType string) string {
@@ -63,10 +68,14 @@ func ProxyDisplayName(proxyType string) string {
 		return "TProxy"
 	case TypeDirect:
 		return "Direct"
+	case TypeEBPF:
+		return "eBPF"
 	case TypeBridge:
 		return "Bridge"
 	case TypeBlock:
 		return "Block"
+	case TypePass:
+		return "Pass"
 	case TypeDNS:
 		return "DNS"
 	case TypeSOCKS:
@@ -125,6 +134,12 @@ func ProxyDisplayName(proxyType string) string {
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
+	case TypeLoadBalance:
+		return "LoadBalance"
+	case TypeSmart:
+		return "Smart"
+	case TypeAdaptivePool:
+		return "AdaptivePool"
 	default:
 		return "Unknown"
 	}

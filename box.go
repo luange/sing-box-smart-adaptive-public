@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/adapter/provider"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/certificate"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -24,6 +25,7 @@ import (
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/experimental/clashmode"
+	"github.com/sagernet/sing-box/experimental/connectionhistory"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -48,6 +50,7 @@ type Box struct {
 	endpoint            *endpoint.Manager
 	inbound             *inbound.Manager
 	outbound            *outbound.Manager
+	provider            *provider.Manager
 	service             *boxService.Manager
 	certificateProvider *boxCertificate.Manager
 	dnsTransport        *dns.TransportManager
@@ -71,6 +74,7 @@ type Options struct {
 func Context(
 	ctx context.Context,
 	inboundRegistry adapter.InboundRegistry,
+	providerRegistry adapter.ProviderRegistry,
 	outboundRegistry adapter.OutboundRegistry,
 	endpointRegistry adapter.EndpointRegistry,
 	dnsTransportRegistry adapter.DNSTransportRegistry,
@@ -82,15 +86,30 @@ func Context(
 		ctx = service.ContextWith[option.InboundOptionsRegistry](ctx, inboundRegistry)
 		ctx = service.ContextWith[adapter.InboundRegistry](ctx, inboundRegistry)
 	}
+	if service.FromContext[option.ProviderOptionsRegistry](ctx) == nil ||
+		service.FromContext[adapter.ProviderRegistry](ctx) == nil {
+		ctx = service.ContextWith[option.ProviderOptionsRegistry](ctx, providerRegistry)
+		ctx = service.ContextWith[adapter.ProviderRegistry](ctx, providerRegistry)
+	}
 	if service.FromContext[option.OutboundOptionsRegistry](ctx) == nil ||
 		service.FromContext[adapter.OutboundRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.OutboundOptionsRegistry](ctx, outboundRegistry)
 		ctx = service.ContextWith[adapter.OutboundRegistry](ctx, outboundRegistry)
 	}
+	if service.FromContext[option.OutboundSupportRegistry](ctx) == nil {
+		if supportRegistry, ok := outboundRegistry.(option.OutboundSupportRegistry); ok {
+			ctx = service.ContextWith[option.OutboundSupportRegistry](ctx, supportRegistry)
+		}
+	}
 	if service.FromContext[option.EndpointOptionsRegistry](ctx) == nil ||
 		service.FromContext[adapter.EndpointRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.EndpointOptionsRegistry](ctx, endpointRegistry)
 		ctx = service.ContextWith[adapter.EndpointRegistry](ctx, endpointRegistry)
+	}
+	if service.FromContext[option.EndpointSupportRegistry](ctx) == nil {
+		if supportRegistry, ok := endpointRegistry.(option.EndpointSupportRegistry); ok {
+			ctx = service.ContextWith[option.EndpointSupportRegistry](ctx, supportRegistry)
+		}
 	}
 	if service.FromContext[adapter.DNSTransportRegistry](ctx) == nil {
 		ctx = service.ContextWith[option.DNSTransportOptionsRegistry](ctx, dnsTransportRegistry)
@@ -118,6 +137,7 @@ func New(options Options) (*Box, error) {
 	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
 	inboundRegistry := service.FromContext[adapter.InboundRegistry](ctx)
 	outboundRegistry := service.FromContext[adapter.OutboundRegistry](ctx)
+	providerRegistry := service.FromContext[adapter.ProviderRegistry](ctx)
 	dnsTransportRegistry := service.FromContext[adapter.DNSTransportRegistry](ctx)
 	serviceRegistry := service.FromContext[adapter.ServiceRegistry](ctx)
 	certificateProviderRegistry := service.FromContext[adapter.CertificateProviderRegistry](ctx)
@@ -130,6 +150,9 @@ func New(options Options) (*Box, error) {
 	}
 	if outboundRegistry == nil {
 		return nil, E.New("missing outbound registry in context")
+	}
+	if providerRegistry == nil {
+		return nil, E.New("missing provider registry in context")
 	}
 	if dnsTransportRegistry == nil {
 		return nil, E.New("missing DNS transport registry in context")
@@ -160,6 +183,7 @@ func New(options Options) (*Box, error) {
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
 	}
+	needConnectionHistory := experimentalOptions.ConnectionHistory != nil && experimentalOptions.ConnectionHistory.Enabled
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
@@ -174,7 +198,7 @@ func New(options Options) (*Box, error) {
 	logFactory, err := log.New(log.Options{
 		Context:        ctx,
 		Options:        common.PtrValueOrDefault(options.Log),
-		Observable:     needClashAPI && experimentalOptions.ClashAPI.ExternalController != "",
+		Observable:     needClashAPI || needAPIService || needConnectionHistory,
 		DefaultWriter:  defaultLogWriter,
 		BaseTime:       createdAt,
 		PlatformWriter: options.PlatformLogWriter,
@@ -208,12 +232,17 @@ func New(options Options) (*Box, error) {
 	endpointManager := endpoint.NewManager(endpointRegistry)
 	inboundManager := inbound.NewManager(inboundRegistry, endpointManager)
 	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, routeOptions.Final)
+	providerManager := provider.NewManager(ctx, logFactory.NewLogger("provider"), providerRegistry)
 	dnsTransportManager := dns.NewTransportManager(dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(certificateProviderRegistry)
 	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
 	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
+	service.MustRegister[adapter.ProviderManager](ctx, providerManager)
+	dnsAnswerHub := adapter.NewDNSAnswerObserverHub()
+	service.MustRegister[*adapter.DNSAnswerObserverHub](ctx, dnsAnswerHub)
+	service.MustRegister[adapter.DNSAnswerObserver](ctx, dnsAnswerHub)
 	service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportManager)
 	service.MustRegister[adapter.ServiceManager](ctx, serviceManager)
 	service.MustRegister[adapter.CertificateProviderManager](ctx, certificateProviderManager)
@@ -240,8 +269,9 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
 	}
-	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
-		trafficManager := trafficcontrol.NewManager()
+	var trafficManager *trafficcontrol.Manager
+	if needClashAPI || needAPIService || needConnectionHistory || options.PlatformLogWriter != nil {
+		trafficManager = trafficcontrol.NewManager()
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)
 		internalServices = append(internalServices, trafficManager)
@@ -346,6 +376,18 @@ func New(options Options) (*Box, error) {
 			return nil, E.Cause(err, "initialize service[", i, "]")
 		}
 	}
+	for i, providerOptions := range options.Providers {
+		var tag string
+		if providerOptions.Tag != "" {
+			tag = providerOptions.Tag
+		} else {
+			tag = F.ToString(i)
+		}
+		err = providerManager.Create(ctx, router, logFactory, tag, providerOptions.Type, providerOptions.Options)
+		if err != nil {
+			return nil, E.Cause(err, "initialize provider[", i, "]")
+		}
+	}
 	for i, outboundOptions := range options.Outbounds {
 		var tag string
 		if outboundOptions.Tag != "" {
@@ -425,6 +467,14 @@ func New(options Options) (*Box, error) {
 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
 		internalServices = append(internalServices, cacheFile)
 	}
+	if needConnectionHistory {
+		historyService, historyErr := connectionhistory.New(ctx, logFactory.NewLogger("connection-history"), trafficManager, *experimentalOptions.ConnectionHistory)
+		if historyErr != nil {
+			return nil, E.Cause(historyErr, "create connection history")
+		}
+		service.MustRegister[connectionhistory.Service](ctx, historyService)
+		internalServices = append(internalServices, historyService)
+	}
 	if needClashAPI {
 		clashServer, err := experimental.NewClashServer(ctx, logFactory.(log.ObservableFactory), common.PtrValueOrDefault(experimentalOptions.ClashAPI))
 		if err != nil {
@@ -470,6 +520,7 @@ func New(options Options) (*Box, error) {
 		endpoint:            endpointManager,
 		inbound:             inboundManager,
 		outbound:            outboundManager,
+		provider:            providerManager,
 		dnsTransport:        dnsTransportManager,
 		service:             serviceManager,
 		certificateProvider: certificateProviderManager,
@@ -562,6 +613,7 @@ func (s *Box) preStart() error {
 		boxComponent{"connection", s.connection},
 		boxComponent{"router", s.router},
 		boxComponent{"outbound", s.outbound},
+		boxComponent{"provider", s.provider},
 		boxComponent{"endpoint", s.endpoint},
 		boxComponent{"certificate-provider", s.certificateProvider},
 		boxComponent{"inbound", s.inbound},
@@ -571,6 +623,7 @@ func (s *Box) preStart() error {
 		return err
 	}
 	err = s.startComponents(adapter.StartStateStart,
+		boxComponent{"provider", s.provider},
 		boxComponent{"outbound", s.outbound},
 		boxComponent{"dns-transport", s.dnsTransport},
 		boxComponent{"network", s.network},
@@ -614,6 +667,7 @@ func (s *Box) start() error {
 	}
 	err = s.startComponents(adapter.StartStatePostStart,
 		boxComponent{"outbound", s.outbound},
+		boxComponent{"provider", s.provider},
 		boxComponent{"network", s.network},
 		boxComponent{"dns-transport", s.dnsTransport},
 		boxComponent{"dns-router", s.dnsRouter},
@@ -638,6 +692,7 @@ func (s *Box) start() error {
 		boxComponent{"connection", s.connection},
 		boxComponent{"router", s.router},
 		boxComponent{"outbound", s.outbound},
+		boxComponent{"provider", s.provider},
 		boxComponent{"endpoint", s.endpoint},
 		boxComponent{"certificate-provider", s.certificateProvider},
 		boxComponent{"inbound", s.inbound},

@@ -1133,6 +1133,34 @@ func (r *Router) recordReverseMapping(message *mDNS.Msg, response *mDNS.Msg, tra
 	}
 }
 
+// notifyDNSAnswerObservers exposes successful A/AAAA answers to optional
+// acceleration observers. Observers are fail-open and receive no client identity.
+func (r *Router) notifyDNSAnswerObservers(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
+	if response == nil || len(response.Answer) == 0 || message == nil || len(message.Question) == 0 {
+		return
+	}
+	observer := service.FromContext[adapter.DNSAnswerObserver](r.ctx)
+	if observer == nil {
+		return
+	}
+	addresses := make([]netip.Addr, 0, 4)
+	for _, answer := range response.Answer {
+		switch record := answer.(type) {
+		case *mDNS.A:
+			if address := M.AddrFromIP(record.A); address.IsValid() {
+				addresses = append(addresses, address)
+			}
+		case *mDNS.AAAA:
+			if address := M.AddrFromIP(record.AAAA); address.IsValid() {
+				addresses = append(addresses, address)
+			}
+		}
+	}
+	if len(addresses) > 0 {
+		observer.OnDNSAnswer(FqdnToDomain(message.Question[0].Name), addresses, transport != nil && transport.Type() == C.DNSTypeFakeIP)
+	}
+}
+
 func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeContext, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, adapter.DNSTransport, error) {
 	var (
 		transport adapter.DNSTransport
@@ -1210,6 +1238,7 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		return nil, err
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyDNSAnswerObservers(message, response, transport)
 	return response, nil
 }
 
@@ -1243,6 +1272,7 @@ func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTra
 		return
 	}
 	r.recordReverseMapping(message, response, transport)
+	r.notifyDNSAnswerObservers(message, response, transport)
 	callback(response, nil)
 }
 

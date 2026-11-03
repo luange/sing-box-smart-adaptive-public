@@ -46,3 +46,16 @@ func (r *SourceMACAddressItem) String() string {
 	}
 	return description
 }
+
+func (r *SourceMACAddressItem) MACAddresses() []net.HardwareAddr {
+	if r == nil {
+		return nil
+	}
+	addresses := make([]net.HardwareAddr, 0, len(r.addresses))
+	for _, rawAddress := range r.addresses {
+		if address, err := net.ParseMAC(rawAddress); err == nil {
+			addresses = append(addresses, address)
+		}
+	}
+	return addresses
+}
